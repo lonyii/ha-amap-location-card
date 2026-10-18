@@ -16,7 +16,7 @@
  *   · iPhone Safari：touch-action 手势治理、固定 px 高度、WebGL 探测、点击兜底
  * ============================================================================= */
 
-const ALC_VERSION = '1.0.8';
+const ALC_VERSION = '1.0.9';
 const ALC_CARD_TAG = 'amap-location-card';
 const ALC_EDITOR_TAG = 'amap-location-card-editor';
 
@@ -2065,6 +2065,11 @@ class AmapLocationCard extends HTMLElement {
     if (!this._fillTimer) {
       this._fillTimer = setInterval(() => this._recheckFill(), 1500);
     }
+    // 页面滚动（长仪表盘）也会改变卡片相对视口的位置，滚动停下来后补算一次
+    if (!this._onFillScroll) {
+      this._onFillScroll = () => this._scheduleFillRecheck();
+      try { window.addEventListener('scroll', this._onFillScroll, { passive: true }); } catch (e) { /* ignore */ }
+    }
   }
 
   /** 复核一次铺满高度；高度真的变了才 resize 地图 */
@@ -2104,8 +2109,9 @@ class AmapLocationCard extends HTMLElement {
     if (!rect) return 0;
 
     // ① 文档流里的上方占位：地址栏、HA 顶栏、编辑模式下的视图标签栏都会把卡片往下顶，
-    //    这段距离就是已经被它们吃掉的高度。
-    const flowTop = Math.max(0, Math.min(Math.round(rect.top), vh - 120));
+    //    这段距离就是已经被它们吃掉的高度。上限 40% 视口 —— 卡片在长页面里滚动到很下面时
+    //    rect.top 会很大，那不是「被工具栏占掉」，不能据此把地图压到最小高度。
+    const flowTop = Math.max(0, Math.min(Math.round(rect.top), Math.round(vh * 0.4)));
     // ② 浮在卡片上方的工具栏：HA 进编辑模式后标签栏有时是 fixed 覆盖层，此时 rect.top 仍是 0，
     //    单看 rect.top 会以为「上方没东西」→ 地图照样铺满 → 编辑按钮被挤出屏幕。这里实测补上。
     const top = Math.max(flowTop, this._measureTopGap(vh, flowTop));
@@ -2150,12 +2156,21 @@ class AmapLocationCard extends HTMLElement {
       if (n === host) return true;
       try { return !!(n.getRootNode && n.getRootNode() === this._shadow); } catch (e) { return false; }
     };
-    for (let y = 0; y < limit; y += 2) {
+    // 先粗扫（12px 一步）定位大致边界，再在该段里细扫（1px），
+    // 避免每 1.5 秒巡检时几百次 elementFromPoint 拖慢渲染线程。
+    let coarse = -1;
+    for (let y = 0; y < limit; y += 12) {
+      let n = null;
+      try { n = document.elementFromPoint(x, y); } catch (e) { return fallback; }
+      if (isMine(n)) { coarse = y; break; }
+    }
+    if (coarse < 0) return fallback;
+    for (let y = Math.max(0, coarse - 12); y < coarse; y += 1) {
       let n = null;
       try { n = document.elementFromPoint(x, y); } catch (e) { return fallback; }
       if (isMine(n)) return y;
     }
-    return fallback;
+    return coarse;
   }
 
   /** iOS Home 指示条等系统安全区高度（读 env(safe-area-inset-bottom)，取不到按 0 算） */
@@ -3106,6 +3121,10 @@ class AmapLocationCard extends HTMLElement {
     if (this._fillRecheckTimer) {
       clearTimeout(this._fillRecheckTimer);
       this._fillRecheckTimer = null;
+    }
+    if (this._onFillScroll) {
+      try { window.removeEventListener('scroll', this._onFillScroll); } catch (e) { /* ignore */ }
+      this._onFillScroll = null;
     }
     if (this._fillRaf) {
       try { (window.cancelAnimationFrame || clearTimeout)(this._fillRaf); } catch (e) { /* ignore */ }
