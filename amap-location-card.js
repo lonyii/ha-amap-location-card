@@ -178,7 +178,7 @@ function parseMapHeight(v) {
 
   const s = raw.replace(/\s+/g, ' ').trim();
   if (s.length > 80) return null;
-  if (!/^[0-9a-zA-Z.%()+\-*/\s,]+$/.test(s)) return null;   // 白名单字符
+  if (!/^[0-9a-zA-Z.%()+\-*/\s,_]+$/.test(s)) return null;   // 白名单字符
   if (/url\s*\(|expression|javascript:|@import|;/i.test(s)) return null;
 
   // 带单位的长度：100vh / 420px / 100% / 60em
@@ -1807,10 +1807,13 @@ class AmapLocationCard extends HTMLElement {
     const fill = !mapH && !!cfg.fill_viewport && !editor;
     this._fillViewport = fill;
     const fillClass = fill ? ' alc-fill' : '';
-    // 百分比高度要跟着容器走：加 alc-h100 让卡片取父容器高度（panel 视图 / 全屏容器）
-    const h100Class = (mapH && /%/.test(mapH)) ? ' alc-h100' : '';
+    // 百分比高度（100%）跟着容器走：卡片改 flex 纵向、地图区 flex 撑满，
+    // 父容器（panel 视图 / 全屏容器）给了高度就正好一屏，没给就退回 120px 保底。
+    const pct = !!(mapH && /%/.test(mapH));
+    const h100Class = pct ? ' alc-h100' : '';
     const wrapStyle = fill ? ''
-      : (mapH ? ` style="height:${mapH};min-height:120px"` : ` style="height:${cfg.height}px"`);
+      : (pct ? ' style="min-height:120px"'
+        : (mapH ? ` style="height:${mapH};min-height:120px"` : ` style="height:${cfg.height}px"`));
     // 只保留地图本体：顶部标题栏与底部工具栏都已取消，
     // 操作入口全部浮在地图右下的控件列上（回到定位 / + / − / 列表），列表点开在后面展开。
     const cardTitle = String(cfg.title || '').trim();
@@ -1843,6 +1846,13 @@ class AmapLocationCard extends HTMLElement {
           <div class="alc-list-body" id="alc-list-body"></div>
         </div>
       </ha-card>`;
+
+    /* map_height 是百分比时，宿主自定义元素自己也得跟着容器高 ——
+       shadow 里的 ha-card { height:100% } 是相对宿主算的，宿主 height:auto 时
+       百分比高度无处可依，地图会退回 120px 保底（Chromium 实测）。 */
+    try {
+      this.style.height = pct ? '100%' : '';
+    } catch (e) { /* ignore */ }
 
     this._els = {
       root: this._shadow.querySelector('.alc-root'),
@@ -4003,8 +4013,10 @@ ha-card { overflow:hidden; }
                                          可视高度 − 上方顶栏/地址栏 − 下方底栏/工具栏 */
 .alc-root.alc-fill .alc-map-wrap { flex:1 1 auto; min-height:160px; }
 /* map_height 用百分比（如 100%）时，卡片高度跟随父容器 —— 与参考项目的 height:100% 语义一致。
-   父容器（panel 视图、全屏容器）没给高度时自动退回内容高度，不会塌成 0。 */
-.alc-root.alc-h100 { height:100%; }
+   父容器（panel 视图、全屏容器）没给高度时自动退回 120px 保底，不会塌成 0。 */
+.alc-root.alc-h100 { height:100%; display:flex; flex-direction:column; }
+.alc-root.alc-h100 .alc-map-wrap { flex:1 1 auto; min-height:120px; }
+.alc-root.alc-h100 .alc-list { max-height:min(45vh, 55%); }
 /* 列表高度也按百分比收敛：卡片让出底栏后总高变小，纯 vh 会把列表顶到地图上方 */
 .alc-root.alc-fill .alc-list { max-height:min(45vh, 55%); }
 /* z-index:0 让 .alc-map 自成叠加上下文，把高德内部的标记/Logo/iframe 全部压在本卡片的
