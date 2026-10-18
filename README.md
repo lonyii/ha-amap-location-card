@@ -1,0 +1,1 @@
+# ha-amap-location-card
