@@ -16,7 +16,7 @@
  *   · iPhone Safari：touch-action 手势治理、固定 px 高度、WebGL 探测、点击兜底
  * ============================================================================= */
 
-const ALC_VERSION = '1.0.5';
+const ALC_VERSION = '1.0.6';
 const ALC_CARD_TAG = 'amap-location-card';
 const ALC_EDITOR_TAG = 'amap-location-card-editor';
 
@@ -44,6 +44,11 @@ const ALC_DEFAULTS = {
   /* 铺满浏览器窗口：地图自动撑满可视区域（配置编辑器里的预览不铺满）。
      关掉后回到固定高度 height。 */
   fill_viewport: true,
+  /* 自定义地图高度（最高优先级，规则对齐 lonyii/ha-map-card-recode 的 map_height）：
+       数字        → 像素，如 480
+       字符串      → 原样当 CSS 高度，如 "100vh"、"calc(100dvh - 120px)"、"100%"
+     留空 = 不启用；启用后 fill_viewport / height 都不再生效。 */
+  map_height: '',
 
   /* 高德 Key —— 只需要一个：同一个 Key 同时用于坐标转换、周边检索与地图底图 */
   amap_key: '',
@@ -146,6 +151,80 @@ const toNum = (v) => {
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 解析「自定义地图高度」——规则与 ha-map-card-recode 的 map_height 一致：
+ *   数字          → 当作像素（收在 120~3000）
+ *   纯数字字符串   → 同上（YAML 里写成字符串也能用）
+ *   CSS 长度字符串 → 原样使用：`100vh`、`100dvh`、`calc(100dvh - 120px)`、`100%`、`60em`
+ * 返回 null = 不启用（留空、非法值）。
+ *
+ * 安全护栏：这是要直接写进内联 style 的值，只放行「长度 / calc / var」用得上的字符，
+ * 出现 `;` `{}` `url(` `expression` 之类一律判非法 —— 一个高度配置项不该变成
+ * 任意 CSS 注入口。
+ */
+function parseMapHeight(v) {
+  if (v === null || v === undefined) return null;
+  if (typeof v === 'number') {
+    return Number.isFinite(v) ? `${Math.round(clamp(v, 120, 3000))}px` : null;
+  }
+  const raw = String(v).trim();
+  if (!raw) return null;
+
+  // 纯数字 → px
+  if (/^[+-]?(\d+(\.\d+)?|\.\d+)$/.test(raw)) {
+    return `${Math.round(clamp(parseFloat(raw), 120, 3000))}px`;
+  }
+
+  const s = raw.replace(/\s+/g, ' ').trim();
+  if (s.length > 80) return null;
+  if (!/^[0-9a-zA-Z.%()+\-*/\s,]+$/.test(s)) return null;   // 白名单字符
+  if (/url\s*\(|expression|javascript:|@import|;/i.test(s)) return null;
+
+  // 带单位的长度：100vh / 420px / 100% / 60em
+  const m = /^(\d+(?:\.\d+)?)(px|vh|dvh|svh|lvh|vw|%|em|rem)$/i.exec(s);
+  if (m) {
+    const n = parseFloat(m[1]);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    const unit = m[2];
+    const val = unit.toLowerCase() === 'px' ? Math.round(clamp(n, 120, 3000)) : n;
+    return `${val}${unit}`;
+  }
+
+  // calc(...) / var(--x) 形式：括号必须配平
+  if (/^(calc|min|max|clamp|var)\s*\(/i.test(s)) {
+    let depth = 0;
+    for (const ch of s) {
+      if (ch === '(') depth += 1;
+      else if (ch === ')') depth -= 1;
+      if (depth < 0) return null;
+    }
+    return depth === 0 ? s : null;
+  }
+  return null;
+}
+
+/** 把 map_height 的 CSS 值折算成像素，仅用于 getCardSize() 给 HA 网格留位（估算即可） */
+function cssHeightToPx(css, vh) {
+  if (!css) return null;
+  const viewport = vh || 800;
+  const m = /^(\d+(?:\.\d+)?)(px|vh|dvh|svh|lvh|vw|%|em|rem)$/i.exec(String(css).trim());
+  if (m) {
+    const n = parseFloat(m[1]);
+    const u = m[2].toLowerCase();
+    if (u === 'px') return n;
+    if (u === '%' || u === 'vw') return viewport * n / 100;
+    if (u === 'em' || u === 'rem') return n * 16;
+    return viewport * n / 100;       // vh / dvh / svh / lvh
+  }
+  const calc = /calc\(\s*(\d+(?:\.\d+)?)(px|dvh|vh|%)\s*[-+]\s*(\d+(?:\.\d+)?)(px|dvh|vh|%)\s*\)/i.exec(String(css));
+  if (calc) {
+    const px = (n, u) => (u.toLowerCase() === 'px' ? n : viewport * n / 100);
+    return Math.max(120, px(parseFloat(calc[1]), calc[2]) - px(parseFloat(calc[3]), calc[4]));
+  }
+  if (/calc\(/i.test(String(css))) return Math.round(viewport * 0.8);   // 复杂 calc：给个合理估值
+  return null;
+}
 
 function escapeHtml(v) {
   return String(v === null || v === undefined ? '' : v)
@@ -1592,6 +1671,7 @@ class AmapLocationCard extends HTMLElement {
     const cfg = Object.assign({}, ALC_DEFAULTS, config);
     cfg.height = clamp(toNum(cfg.height) || 320, 120, 1200);
     cfg.fill_viewport = cfg.fill_viewport !== false;   // 默认 true，显式 false 才关
+    cfg.map_height = parseMapHeight(cfg.map_height);  // null = 不启用（非法值静默忽略）
     cfg.fallback_tiles = cfg.fallback_tiles !== false; // 瓦片底图默认开（关掉就只剩网格占位）
     cfg.radius = clamp(toNum(cfg.radius) || 2000, 50, 50000);
     cfg.auto_radius_pad = clamp(toNum(cfg.auto_radius_pad) || 1, 0.2, 4);
@@ -1678,12 +1758,20 @@ class AmapLocationCard extends HTMLElement {
   }
 
   getCardSize() {
-    if (this._cfg && this._cfg.fill_viewport && !this._inEditorPreview()) {
+    const editor = this._inEditorPreview();
+    const cfg = this._cfg || {};
+    // 与 _build 的高度规则保持一致：map_height > fill_viewport > height
+    if (cfg.map_height && !editor) {
+      const vh = (typeof window !== 'undefined' && window.innerHeight) || 800;
+      const px = cssHeightToPx(cfg.map_height, vh) || cfg.height || 320;
+      return Math.max(4, Math.round(px / 50) + 3);
+    }
+    if (cfg.fill_viewport && !editor) {
       const vh = (typeof window !== 'undefined' && window.innerHeight) || 800;
       // 减掉已测到的底部工具栏高度，masonry 预留的高度才不会把列表挤到屏幕外
       return Math.max(6, Math.round((vh - (this._fillGap || 0)) / 50));
     }
-    const h = (this._cfg && this._cfg.height) || 320;
+    const h = cfg.height || 320;
     return Math.max(4, Math.round(h / 50) + 3);
   }
 
@@ -1709,15 +1797,27 @@ class AmapLocationCard extends HTMLElement {
 
   _build() {
     const cfg = this._cfg;
-    const fill = !!cfg.fill_viewport && !this._inEditorPreview();
+    const editor = this._inEditorPreview();
+    // 高度规则（对齐 lonyii/ha-map-card-recode）：
+    //   map_height 有值 → 直接用这条 CSS（100vh / calc(100dvh - 120px) / 数字px），不再做任何视口扣减；
+    //   否则 fill_viewport → 自动铺满（可视高度 − 上下工具栏）；
+    //   否则 → 固定 height。
+    // 配置编辑器预览里既不满屏也不认 100vh，避免把配置面板整个撑爆。
+    const mapH = (!editor && cfg.map_height) ? cfg.map_height : '';
+    const fill = !mapH && !!cfg.fill_viewport && !editor;
     this._fillViewport = fill;
+    const fillClass = fill ? ' alc-fill' : '';
+    // 百分比高度要跟着容器走：加 alc-h100 让卡片取父容器高度（panel 视图 / 全屏容器）
+    const h100Class = (mapH && /%/.test(mapH)) ? ' alc-h100' : '';
+    const wrapStyle = fill ? ''
+      : (mapH ? ` style="height:${mapH};min-height:120px"` : ` style="height:${cfg.height}px"`);
     // 只保留地图本体：顶部标题栏与底部工具栏都已取消，
     // 操作入口全部浮在地图右下的控件列上（回到定位 / + / − / 列表），列表点开在后面展开。
     const cardTitle = String(cfg.title || '').trim();
     this._shadow.innerHTML = `
       <style>${ALC_STYLES}</style>
-      <ha-card class="alc-root${fill ? ' alc-fill' : ''}"${cardTitle ? ` aria-label="${escapeHtml(cardTitle)}"` : ''}>
-        <div class="alc-map-wrap"${fill ? '' : ` style="height:${cfg.height}px"`}>
+      <ha-card class="alc-root${fillClass}${h100Class}"${cardTitle ? ` aria-label="${escapeHtml(cardTitle)}"` : ''}>
+        <div class="alc-map-wrap"${wrapStyle}>
           <div class="alc-map" id="alc-map"></div>
           <div class="alc-gesture" id="alc-gesture"></div>
           <div class="alc-ctrl" id="alc-ctrl">
@@ -3503,8 +3603,9 @@ const ALC_EDITOR_SECTIONS = [
         ['gcj02', 'GCJ-02 / 高德坐标（不纠偏，直接用）'],
       ], hint: '坐标来自 GPS 模块、HA Companion App 等 → 选 WGS-84；来自高德/腾讯等国内 App 上报（本身已是高德坐标）→ 必须选 GCJ-02，否则所有点会在高德底图上整体偏移约 300~600 米' },
       { key: 'title', label: '卡片标题（无障碍标签）', type: 'text', hint: '顶部标题栏已取消；这里只作为读屏/悬浮提示用的名称，留空则用实体名称' },
-      { key: 'height', label: '地图高度（px）', type: 'number', min: 120, max: 1200, dependsOn: { fill_viewport: false }, hint: '仅在关闭「铺满窗口」时生效' },
-      { key: 'fill_viewport', label: '铺满浏览器窗口', type: 'boolean', hint: '开：高度 = 可视高度 − 上方顶栏/地址栏 − 下方底栏/工具栏（HA 底部导航、App tab bar 都算在内），配置编辑器的预览不会铺满；关：使用上面的固定高度' },
+      { key: 'map_height', label: '全屏高度（自定义 CSS，优先级最高）', type: 'text', placeholder: '100dvh 或 calc(100dvh - 120px)', hint: '参照 ha-map-card-recode 的高度规则：数字=像素；字符串原样当 CSS 高度，如 100vh / 100dvh / calc(100dvh - 120px) / 100%（100% 会跟随父容器高度）。填了它就不再自动测量、也不看下面的「铺满窗口」和固定高度。留空则用自动铺满。' },
+      { key: 'height', label: '地图高度（px）', type: 'number', min: 120, max: 1200, dependsOn: { fill_viewport: false }, hint: '仅在关闭「铺满窗口」且未填上面的自定义高度时生效' },
+      { key: 'fill_viewport', label: '铺满浏览器窗口', type: 'boolean', hint: '开：高度 = 可视高度 − 上方顶栏/地址栏 − 下方底栏/工具栏（HA 底部导航、App tab bar 都算在内），配置编辑器的预览不会铺满；关：使用上面的固定高度。填了「全屏高度」时本项不生效' },
       { key: 'view_mode', label: '视图模式', type: 'select', options: [['follow', '自动跟随实体居中'], ['locked', '手动锁定视图']] },
       { key: 'follow_zoom', label: '跟随缩放级别', type: 'number', min: 3, max: 19, dependsOn: { view_mode: 'follow' } },
       { key: 'locked_center', label: '锁定中心（经度,纬度）', type: 'text', dependsOn: { view_mode: 'locked' }, placeholder: '116.397428,39.90923' },
@@ -3901,6 +4002,9 @@ ha-card { overflow:hidden; }
   height:var(--alc-fill-h, 100dvh); }  /* 实际值由 _syncFillHeight() 写入：
                                          可视高度 − 上方顶栏/地址栏 − 下方底栏/工具栏 */
 .alc-root.alc-fill .alc-map-wrap { flex:1 1 auto; min-height:160px; }
+/* map_height 用百分比（如 100%）时，卡片高度跟随父容器 —— 与参考项目的 height:100% 语义一致。
+   父容器（panel 视图、全屏容器）没给高度时自动退回内容高度，不会塌成 0。 */
+.alc-root.alc-h100 { height:100%; }
 /* 列表高度也按百分比收敛：卡片让出底栏后总高变小，纯 vh 会把列表顶到地图上方 */
 .alc-root.alc-fill .alc-list { max-height:min(45vh, 55%); }
 /* z-index:0 让 .alc-map 自成叠加上下文，把高德内部的标记/Logo/iframe 全部压在本卡片的
