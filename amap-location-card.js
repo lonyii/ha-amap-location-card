@@ -32,6 +32,13 @@ const AMAP_JS_VERSION = '2.0';
  */
 const ALC_GCJ_MAX_SHIFT = 0.05;
 
+/**
+ * 铺满模式下底部额外让出的安全区（px）。
+ * 除了系统安全区（env(safe-area-inset-bottom)）之外再留一点，
+ * 这样 HA 编辑模式底部浮出来的按钮不会贴着地图边。
+ */
+const ALC_FILL_SAFE_BOTTOM = 8;
+
 /* =============================================================================
  *  1. 默认配置
  * ============================================================================= */
@@ -1793,6 +1800,17 @@ class AmapLocationCard extends HTMLElement {
 
     // 首次渲染时若浏览器没有 WebGL / 未加载 JS API，等一帧再建图，避免容器尺寸为 0
     if (first) requestAnimationFrame(() => { if (this._resizeMap) this._resizeMap(); });
+    // HA 切进/切出编辑模式时 hass 会更新（视口不变、DOM 变了），顺手复核一次铺满高度
+    else if (this._fillViewport) this._scheduleFillRecheck();
+  }
+
+  /** hass 频繁更新时也别每次都量：合并到 250ms 一次 */
+  _scheduleFillRecheck() {
+    if (this._fillRecheckTimer) return;
+    this._fillRecheckTimer = setTimeout(() => {
+      this._fillRecheckTimer = null;
+      if (this._cfg) this._recheckFill();
+    }, 250);
   }
 
   get hass() { return this._hass; }
@@ -2021,7 +2039,45 @@ class AmapLocationCard extends HTMLElement {
           if (window.visualViewport) window.visualViewport.addEventListener('resize', this._onViewportResize);
         } catch (e) { /* ignore */ }
       }
+      this._startFillWatch();
     }
+  }
+
+  /**
+   * 持续复核铺满高度。
+   *
+   * 为什么光靠 resize 事件不够：HA 进「编辑仪表盘」时，上方会插进视图标签栏、
+   * 下方浮出编辑按钮 —— 这些变化**不一定**触发 window resize（视口没变，只是 HA 自己的 DOM 变了），
+   * 于是卡片还按旧高度铺满，编辑按钮被顶到屏幕外。
+   * 这里两条腿走路：
+   *  ① ResizeObserver 盯住宿主的上两级容器（HA 视图容器高度一变就重算）； 
+   *  ② 低频巡检（1.5s）兜住「固定/粘性覆盖层」的情况 —— 这种连容器尺寸都不变。
+   * 只有算出来的高度真的变了（> 2px）才动地图，避免无意义重绘。
+   */
+  _startFillWatch() {
+    if (!this._fillRO && typeof ResizeObserver !== 'undefined') {
+      try {
+        this._fillRO = new ResizeObserver(() => this._recheckFill());
+        let node = (this._shadow && this._shadow.host && this._shadow.host.parentElement) || null;
+        for (let i = 0; i < 2 && node; i++) { this._fillRO.observe(node); node = node.parentElement; }
+      } catch (e) { this._fillRO = null; }
+    }
+    if (!this._fillTimer) {
+      this._fillTimer = setInterval(() => this._recheckFill(), 1500);
+    }
+  }
+
+  /** 复核一次铺满高度；高度真的变了才 resize 地图 */
+  _recheckFill() {
+    if (!this._cfg || !this._fillViewport) return 0;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return 0;
+    const before = this._fillH || 0;
+    const h = this._syncFillHeight();
+    if (h && Math.abs(h - before) > 2) {
+      this._log(`铺满高度变化 ${before} → ${h}（上方让出 ${this._fillTop || 0}，底部让出 ${this._fillGap || 0}）`);
+      this._resizeMap();
+    }
+    return h;
   }
 
   refresh() { this._refresh(true); }
@@ -2047,8 +2103,12 @@ class AmapLocationCard extends HTMLElement {
     const rect = root.getBoundingClientRect ? root.getBoundingClientRect() : null;
     if (!rect) return 0;
 
-    // 卡片顶端到视口顶部的距离，正是上方被占掉的高度（顶栏与地址栏都在文档流里）
-    const top = Math.max(0, Math.min(Math.round(rect.top), vh - 120));
+    // ① 文档流里的上方占位：地址栏、HA 顶栏、编辑模式下的视图标签栏都会把卡片往下顶，
+    //    这段距离就是已经被它们吃掉的高度。
+    const flowTop = Math.max(0, Math.min(Math.round(rect.top), vh - 120));
+    // ② 浮在卡片上方的工具栏：HA 进编辑模式后标签栏有时是 fixed 覆盖层，此时 rect.top 仍是 0，
+    //    单看 rect.top 会以为「上方没东西」→ 地图照样铺满 → 编辑按钮被挤出屏幕。这里实测补上。
+    const top = Math.max(flowTop, this._measureTopGap(vh, flowTop));
     const max = Math.max(160, vh - top);
 
     this._fillSyncing = true;
@@ -2057,14 +2117,60 @@ class AmapLocationCard extends HTMLElement {
       // 而不是底栏，直接探测会测不到遮挡 —— 高度就再也长不回去（缩了就回不来）。
       root.style.setProperty('--alc-fill-h', `${max}px`);
       const gap = this._measureBottomGap(vh);
-      const h = Math.max(160, max - gap);
+      // 底部再留一点安全区：iPhone 的 Home 指示条 + 一点视觉呼吸，
+      // 这样哪怕是 HA 编辑模式的浮动按钮也不会贴着地图边。
+      const safe = this._safeAreaBottom() + ALC_FILL_SAFE_BOTTOM;
+      const h = Math.max(160, max - gap - safe);
       root.style.setProperty('--alc-fill-h', `${h}px`);
       this._fillH = h;
       this._fillGap = gap;
+      this._fillTop = top;
       return h;
     } finally {
       this._fillSyncing = false;
     }
+  }
+
+  /**
+   * 顶部被覆盖层压住的高度（px，相对视口顶部）。
+   * 判据：从视口最上方往下探，找到第一个「属于本卡片」的像素行，它上面的部分就是被占掉的。
+   * 卡片在文档流里被顶下来时结果等于 rect.top；HA 编辑模式的固定标签栏盖在卡片上时
+   * 结果会大于 rect.top —— 这正是需要多让出来的高度。
+   */
+  _measureTopGap(vh, flowTop) {
+    const host = this._shadow && this._shadow.host;
+    const fallback = Math.max(0, Math.round(flowTop || 0));
+    if (!host || typeof document.elementFromPoint !== 'function') return fallback;
+    const x = Math.round((window.innerWidth || 0) / 2);
+    if (!x) return fallback;
+    // 最多往下探到 40% 视口，避免怪异布局把整张图压没
+    const limit = Math.min(Math.round(vh * 0.4), Math.max(160, fallback + 200));
+    const isMine = (n) => {
+      if (!n) return false;
+      if (n === host) return true;
+      try { return !!(n.getRootNode && n.getRootNode() === this._shadow); } catch (e) { return false; }
+    };
+    for (let y = 0; y < limit; y += 2) {
+      let n = null;
+      try { n = document.elementFromPoint(x, y); } catch (e) { return fallback; }
+      if (isMine(n)) return y;
+    }
+    return fallback;
+  }
+
+  /** iOS Home 指示条等系统安全区高度（读 env(safe-area-inset-bottom)，取不到按 0 算） */
+  _safeAreaBottom() {
+    try {
+      const host = document.body || document.documentElement;
+      if (!host || !document.createElement) return 0;
+      const el = document.createElement('div');
+      el.style.cssText = 'position:fixed;left:0;bottom:0;width:1px;height:env(safe-area-inset-bottom,0px);'
+        + 'pointer-events:none;visibility:hidden;';
+      host.appendChild(el);
+      const h = Math.round((el.getBoundingClientRect() || {}).height || 0);
+      if (el.parentNode) el.parentNode.removeChild(el);
+      return Math.max(0, Math.min(80, h));
+    } catch (e) { return 0; }
   }
 
   /**
@@ -2989,6 +3095,18 @@ class AmapLocationCard extends HTMLElement {
     clearTimeout(this._listResizeTimer);
     clearTimeout(this._fillTimer1);
     clearTimeout(this._fillTimer2);
+    if (this._fillRO) {
+      try { this._fillRO.disconnect(); } catch (e) { /* ignore */ }
+      this._fillRO = null;
+    }
+    if (this._fillTimer) {
+      clearInterval(this._fillTimer);
+      this._fillTimer = null;
+    }
+    if (this._fillRecheckTimer) {
+      clearTimeout(this._fillRecheckTimer);
+      this._fillRecheckTimer = null;
+    }
     if (this._fillRaf) {
       try { (window.cancelAnimationFrame || clearTimeout)(this._fillRaf); } catch (e) { /* ignore */ }
       this._fillRaf = null;
