@@ -16,7 +16,7 @@
  *   · iPhone Safari：touch-action 手势治理、固定 px 高度、WebGL 探测、点击兜底
  * ============================================================================= */
 
-const ALC_VERSION = '1.0.3';
+const ALC_VERSION = '1.0.4';
 const ALC_CARD_TAG = 'amap-location-card';
 const ALC_EDITOR_TAG = 'amap-location-card-editor';
 
@@ -63,6 +63,9 @@ const ALC_DEFAULTS = {
   map_style: 'amap://styles/normal',
   gesture: 'map',                 // map（地图吃掉手势）| scroll（纵向滚动优先）
   show_source_marker: true,
+  // 高德 JS 底图渲染不出来时（iOS App 内嵌 WKWebView 常见）自动切「瓦片底图」：
+  // 同一套高德栅格瓦片，绕过 JS API 直接画到 canvas，永不见白板。
+  fallback_tiles: true,
   // 搜索范围圈默认不画：检索范围就是整张地图的可视区域，画圈只是多一层视觉噪音
   show_radius_circle: false,
   show_scale: true,
@@ -1017,6 +1020,11 @@ class CanvasFallbackMap {
     const fLat = toNum(opts.focusLat);
     this.focus = (fLng === null || fLat === null) ? null : [fLng, fLat];
     this.radius = toNum(opts.radius) || 0;
+    // 真实瓦片底图：JS API 完全不可用时（iOS App 内嵌 WKWebView 上常见）也不用看白板 ——
+    // 直接按 Web 墨卡托取高德栅格瓦片画到 canvas 上，经纬度投影与 JS API 完全一致。
+    this.tiles = opts.tiles !== false;
+    this._tileCache = new Map();
+    this._tileRaf = null;
     this.markers = [];
     this.onMarkerClick = opts.onMarkerClick || (() => {});
     this.onViewChange = opts.onViewChange || (() => {});
@@ -1062,7 +1070,7 @@ class CanvasFallbackMap {
 
     const badge = document.createElement('div');
     badge.className = 'alc-fm-badge';
-    badge.textContent = '简化视图 · 未加载高德底图';
+    badge.textContent = this.tiles ? '瓦片底图 · 高德' : '简化视图 · 未加载高德底图';
     this.badge = badge;
 
     const popup = document.createElement('div');
@@ -1273,22 +1281,26 @@ class CanvasFallbackMap {
     ctx.fillStyle = bg;
     ctx.fillRect(0, 0, w, h);
 
-    // 网格
     const mpp = metersPerPixel(this.center[1], this.zoom);
-    let step = 200; // 米
-    const steps = [50, 100, 200, 500, 1000, 2000, 5000, 10000];
-    for (const s of steps) { if (s / mpp >= 48) { step = s; break; } step = s; }
-    const stepPx = step / mpp;
-    ctx.strokeStyle = grid;
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    const cx = lonToWorldX(this.center[0], this.zoom);
-    const cy = latToWorldY(this.center[1], this.zoom);
-    const originX = (cx % stepPx);
-    const originY = (cy % stepPx);
-    for (let x = -originX; x <= w; x += stepPx) { ctx.moveTo(Math.round(x) + 0.5, 0); ctx.lineTo(Math.round(x) + 0.5, h); }
-    for (let y = -originY; y <= h; y += stepPx) { ctx.moveTo(0, Math.round(y) + 0.5); ctx.lineTo(w, Math.round(y) + 0.5); }
-    ctx.stroke();
+
+    // 先铺真实瓦片；一张都铺不上（离线 / 瓦片被拦 / 关了瓦片）时才退回网格占位
+    if (!this._drawTiles(ctx, w, h)) {
+      // 网格
+      let step = 200; // 米
+      const steps = [50, 100, 200, 500, 1000, 2000, 5000, 10000];
+      for (const s of steps) { if (s / mpp >= 48) { step = s; break; } step = s; }
+      const stepPx = step / mpp;
+      ctx.strokeStyle = grid;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      const cx = lonToWorldX(this.center[0], this.zoom);
+      const cy = latToWorldY(this.center[1], this.zoom);
+      const originX = (cx % stepPx);
+      const originY = (cy % stepPx);
+      for (let x = -originX; x <= w; x += stepPx) { ctx.moveTo(Math.round(x) + 0.5, 0); ctx.lineTo(Math.round(x) + 0.5, h); }
+      for (let y = -originY; y <= h; y += stepPx) { ctx.moveTo(0, Math.round(y) + 0.5); ctx.lineTo(w, Math.round(y) + 0.5); }
+      ctx.stroke();
+    }
 
     // 定位点（源实体）在画布上的真实落点 —— 拖动地图后它不再等于画布中心
     const fp = this.focusPoint();
@@ -1320,6 +1332,80 @@ class CanvasFallbackMap {
     ctx.moveTo(fp.x - 7, fp.y); ctx.lineTo(fp.x + 7, fp.y);
     ctx.moveTo(fp.x, fp.y - 7); ctx.lineTo(fp.x, fp.y + 7);
     ctx.stroke();
+  }
+
+  /* ------------------------------------------------ 瓦片底图（无 JS API 时） */
+
+  /**
+   * 把高德栅格瓦片铺到 canvas 上。瓦片用的是标准 Web 墨卡托 XYZ 编号，
+   * 与 project()/lonToWorldX() 的投影完全一致，所以标记不需要任何额外偏移。
+   * 返回「是否铺上了至少一张」—— false 时调用方退回网格占位。
+   */
+  _drawTiles(ctx, w, h) {
+    if (!this.tiles || !ctx || typeof ctx.drawImage !== 'function') return false;
+    const z = clamp(this.zoom, 3, 19);
+    const tz = Math.min(z, 18);                        // 高德瓦片最高 18 级
+    const size = 256 * Math.pow(2, z - tz);            // z=19 时把 18 级瓦片放大一倍
+    const left = lonToWorldX(this.center[0], z) - w / 2;
+    const top = latToWorldY(this.center[1], z) - h / 2;
+    const n = Math.pow(2, tz);
+    const x0 = Math.floor(left / size);
+    const y0 = Math.floor(top / size);
+    const x1 = Math.floor((left + w) / size);
+    const y1 = Math.floor((top + h) / size);
+    let drawn = 0;
+    for (let tx = x0; tx <= x1; tx++) {
+      for (let ty = y0; ty <= y1; ty++) {
+        if (ty < 0 || ty >= n) continue;               // 南北极之外没有瓦片
+        const wx = ((tx % n) + n) % n;                 // 东西方向绕地球一圈
+        const img = this._tile(tz, wx, ty);
+        if (!img) continue;
+        ctx.drawImage(img, tx * size - left, ty * size - top, size, size);
+        drawn++;
+      }
+    }
+    return drawn > 0;
+  }
+
+  /** 取瓦片（已加载才返回 img）；未加载过就发起请求，失败的不再重试 */
+  _tile(tz, x, y) {
+    const key = `${tz}/${x}/${y}`;
+    const hit = this._tileCache.get(key);
+    if (hit === 'loading' || hit === 'error') return null;
+    if (hit) return hit;
+    if (this._tileCache.size > 320) this._pruneTiles();
+    const img = document.createElement('img');
+    // 不设 crossOrigin：瓦片若不带 CORS 头，设了反而整批加载失败。
+    // 这里只 drawImage、从不读像素，画布被「污染」没有任何影响。
+    img.decoding = 'async';
+    img.onload = () => {
+      if (!this.canvas) return;                        // 已销毁
+      this._tileCache.set(key, img);
+      this._scheduleTileRender();
+    };
+    img.onerror = () => { this._tileCache.set(key, 'error'); };
+    this._tileCache.set(key, 'loading');
+    img.src = `https://wprd0${1 + ((x + y) % 4)}.is.autonavi.com/appmaptile`
+      + `?lang=zh_cn&size=1&style=7&x=${x}&y=${y}&z=${tz}`;
+    return null;
+  }
+
+  /** 缓存别无限涨：按插入顺序丢掉最老的 80 张（Map 保持插入序） */
+  _pruneTiles() {
+    let n = 0;
+    for (const k of this._tileCache.keys()) {
+      this._tileCache.delete(k);
+      if (++n >= 80) break;
+    }
+  }
+
+  /** 一张瓦片加载完就重绘一次（合并到同一帧，避免十几张各自重绘） */
+  _scheduleTileRender() {
+    if (this._tileRaf) return;
+    const raf = (typeof window !== 'undefined' && window.requestAnimationFrame)
+      ? window.requestAnimationFrame.bind(window)
+      : (fn) => setTimeout(fn, 16);
+    this._tileRaf = raf(() => { this._tileRaf = null; this._render(); });
   }
 
   /** 打开自定义弹窗（与高德 InfoWindow 内容保持一致） */
@@ -1363,7 +1449,13 @@ class CanvasFallbackMap {
 
   destroy() {
     try { if (this._ro) this._ro.disconnect(); } catch (e) { /* ignore */ }
+    if (this._tileRaf) {
+      try { (window.cancelAnimationFrame || clearTimeout)(this._tileRaf); } catch (e) { /* ignore */ }
+      this._tileRaf = null;
+    }
+    this._tileCache.clear();
     this._pointers.clear();
+    this.canvas = null;                 // 让在途的瓦片回调知道自己已被丢弃
     this.host.innerHTML = '';
   }
 }
@@ -1500,6 +1592,7 @@ class AmapLocationCard extends HTMLElement {
     const cfg = Object.assign({}, ALC_DEFAULTS, config);
     cfg.height = clamp(toNum(cfg.height) || 320, 120, 1200);
     cfg.fill_viewport = cfg.fill_viewport !== false;   // 默认 true，显式 false 才关
+    cfg.fallback_tiles = cfg.fallback_tiles !== false; // 瓦片底图默认开（关掉就只剩网格占位）
     cfg.radius = clamp(toNum(cfg.radius) || 2000, 50, 50000);
     cfg.auto_radius_pad = clamp(toNum(cfg.auto_radius_pad) || 1, 0.2, 4);
     cfg.auto_radius_max = clamp(toNum(cfg.auto_radius_max) || 5000, 100, 50000);
@@ -1688,7 +1781,7 @@ class AmapLocationCard extends HTMLElement {
       this._onOnline = () => {
         if (!this._cfg || this._mapMode === 'amap') return;
         // 只有「底图加载/渲染失败」才值得在联网后自动重试；未配置 Key 时重试没有意义
-        const failed = ['jsapi', 'maperr', 'map-timeout', 'mapfail'].some((id) => this._notices.has(id));
+        const failed = ['jsapi', 'maperr', 'map-timeout', 'mapfail', 'tiles'].some((id) => this._notices.has(id));
         if (failed) {
           this._log('网络恢复 → 重新加载底图');
           this._retryMap();
@@ -2291,16 +2384,16 @@ class AmapLocationCard extends HTMLElement {
 
     clearTimeout(this._mapTimeout);
     this._mapTimeout = setTimeout(() => {
-      if (!this._mapReady) {
-        // App 内嵌 WebView（iOS）里偶发：卡片初始尺寸为 0 或 WebGL 上下文被回收，
-        // 高德不会发瓦片请求。这里除了提示，还补一次 resize，很多时候一补就恢复。
-        this._recoverBlankMap();
-        this._showNotice('map-timeout', 'warn',
-          '地图底图渲染超时（App 内嵌浏览器里较常见，多为初始尺寸为 0 或 WebGL 上下文被回收），可点「重试」重建；点位列表不受影响。',
-          '重试', () => this._retryMap(),
-          { label: '复制诊断', action: () => this._copyDiagnostics() });
-        this._showList(true);
-      }
+      if (this._mapReady) return;
+      // App 内嵌 WebView（iOS）里偶发：卡片初始尺寸为 0 或 WebGL 上下文被回收，
+      // 高德不会发瓦片请求。先补一次 resize + 重新应用视野，很多时候一补就恢复。
+      this._recoverBlankMap();
+      if (this._mapReady) return;
+      // 再给 3 秒：真的起不来就不要让用户盯着白板了，直接换成瓦片底图（同一套高德瓦片）
+      clearTimeout(this._mapTimeout2);
+      this._mapTimeout2 = setTimeout(() => {
+        if (!this._mapReady) this._switchToTilesMap();
+      }, 3000);
     }, 12000);
 
     if (cfg.show_toolbar && AMap.plugin) {
@@ -2581,6 +2674,7 @@ class AmapLocationCard extends HTMLElement {
     const center = this._initialCenter();
     this._fbMap = new CanvasFallbackMap(this._mapEl, {
       controls: false,   // 控件列由卡片统一提供（地图右下角），避免两套按钮重叠
+      tiles: this._cfg.fallback_tiles !== false,   // 没有 JS API 也铺真实高德瓦片
       zoom: this._cfg.view_mode === 'locked' ? this._cfg.locked_zoom : this._cfg.follow_zoom,
       centerLng: center[0],
       centerLat: center[1],
@@ -2602,13 +2696,35 @@ class AmapLocationCard extends HTMLElement {
     this._notices.delete('map-timeout');
     this._notices.delete('maperr');
     this._notices.delete('mapfail');
+    this._notices.delete('tiles');
     this._renderNotices();
     this._mapMode = null;
     this._refresh(true);
   }
 
+  /**
+   * 高德 JS 底图迟迟渲染不出瓦片（App 内嵌 WKWebView 上最常见：WebGL 被限制、
+   * 高德内部 canvas 起不来）→ 自动换成瓦片底图。
+   * 换的是同一套高德栅格瓦片，只是绕过 JS API 直接画在 canvas 上，
+   * 所以「空白」会立刻变成真实地图，点位/列表/检索全都不受影响。
+   */
+  _switchToTilesMap() {
+    if (!this._cfg || this._mapMode === 'fallback') return;
+    this._log('高德 JS 底图未就绪 → 自动换成瓦片底图');
+    this._teardownMap();
+    this._createFallbackMap();
+    this._mapMode = 'fallback';
+    this._showNotice('tiles', 'warn',
+      '当前环境里高德 JS 底图没能渲染出瓦片（App 内嵌浏览器常见），已自动换成瓦片底图，地图与点位照常可用。',
+      '重试高清底图', () => this._retryMap(),
+      { label: '复制诊断', action: () => this._copyDiagnostics() });
+    this._renderPins();
+    this._resizeMap();
+  }
+
   _teardownMap() {
     clearTimeout(this._mapTimeout);
+    clearTimeout(this._mapTimeout2);
     clearTimeout(this._radiusTimer);
     clearTimeout(this._suppressTimer);
     this._radiusTimer = null;
@@ -3443,6 +3559,7 @@ const ALC_EDITOR_SECTIONS = [
         ['amap://styles/graffiti', '涂鸦'], ['amap://styles/macaron', '马卡龙'],
       ] },
       { key: 'show_source_marker', label: '显示实体主图标', type: 'boolean' },
+      { key: 'fallback_tiles', label: '无底图时用瓦片兜底', type: 'boolean', hint: '高德 JS 底图渲染不出来时（App 内嵌浏览器常见）自动改用同一套高德栅格瓦片，永不见白板；关掉则只在网格上显示点位' },
       { key: 'show_toolbar', label: '显示缩放 / 回到定位按钮', type: 'boolean', hint: '关闭后地图右下角只留「列表」按钮' },
       { key: 'show_scale', label: '显示比例尺', type: 'boolean', dependsOn: { show_toolbar: true } },
       { key: 'click_action', label: '点击标记行为', type: 'select', options: [['popup', '弹出信息窗'], ['navigate', '直接唤起高德导航']] },
