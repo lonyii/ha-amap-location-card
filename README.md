@@ -1,6 +1,6 @@
-# AMap Location Card
+# AMap Scout · 高德探路卡
 
-高德地图定位卡片 · Home Assistant 自定义 Lovelace 卡片 · 兼容 iPhone Safari
+以实体为圆心的高德地图 · Home Assistant 自定义 Lovelace 卡片 · 兼容 iPhone Safari
 
 读取任意自带经纬度的 HA 实体（WGS-84），通过**高德 Web 服务**强制纠偏为 GCJ-02，
 在高德底图上分层渲染「源实体 / 充电桩 / 公共厕所」，并支持周边检索、弹窗与一键唤起高德导航。
@@ -13,6 +13,7 @@
 
 - [功能特性](#功能特性)
 - [安装](#安装)
+- [命名与迁移（v1.1.0 改名）](#命名与迁移v110-改名)
 - [高德 Key 申请](#高德-key-申请很重要)
 - [快速开始](#快速开始)
 - [完整配置项](#完整配置项)
@@ -37,7 +38,7 @@
 | 坐标校验 | 实体不存在、无经纬度属性、(0,0)、越界都会被拦截并在卡片内给出中文提示，不继续执行 |
 | 强制高德纠偏 | 不使用本地 GCJ-02 算法，调用 `/v3/assistant/coordinate/convert`（`coordsys=gps` + `output=json`），经 `status` / `infocode` 判定，并对返回值做范围与偏移量二次校验 |
 | 三层降级 | Web 服务失败 → 高德 JS API 内置转换 → 原始 WGS-84（并提示偏移风险），任何一层都不炸卡 |
-| 周边检索 | `types=011100` 充电设施、`types=140306` 公共厕所，类型码与搜索范围均可配置 |
+| 周边检索 | `types=011100` 充电设施、`types=200300` 公共厕所，类型码与搜索范围均可配置 |
 | 搜索范围跟随缩放 | 默认 `auto`：检索半径由地图当前可视范围推出，放大收窄、缩小扩大，防抖 600ms + 12% 死区，不烧配额 |
 | 拖动后按新视野重新搜索 | `auto` 模式下检索基点跟随视野中心：拖走地图 600ms 后自动以新视野为中心重搜（中心移动超过半径 25% 或至少 120 米才触发） |
 | 无感检索 | 重检索**全程不显示 loading 遮罩**；标记按 POI 增量复用（同一站点不重建、不闪烁）；**搜不到时不弹任何提示条**，保持安静 |
@@ -46,7 +47,7 @@
 | 缓存 + 节流 | 同坐标默认 5 分钟内不重复转换；所有高德请求串行节流 + 并发去重 + TTL 缓存 |
 | 分层标记 | 源实体（红圈主图标）/ 充电桩（绿）/ 公厕（紫），icon 支持 `mdi:`、图片 URL、`/local/xx.png`、emoji |
 | 朝向箭头（v1.0.11） | 实体带 `heading`（或 `course` / `bearing`）属性时，定位点自动画成指向该方位的箭头，**0° 指正北、顺时针增加**；朝向变化实时跟转，不需要重建卡片 |
-| 弹窗信息 | 充电桩：名称 ｜ 距离 ｜ 电价 ｜ 可用桩数；公厕：名称 ｜ 距离 ｜ 地址 |
+| 弹窗信息 | 充电桩 / 公厕：名称 ｜ 距离（从实体坐标起算）｜ 地址 |
 | 一键导航 | 弹窗内「高德导航」按钮，或直接点击标记即唤起 `uri.amap.com/navigation`（`callnative=1`，可拉起高德 App） |
 | 视图模式 | 「自动跟随实体居中」/「手动锁定视图」；手动拖动后自动暂停跟随 15 秒，避免抢镜头 |
 | 附近列表 | 底部可展开的点位列表，也作为地图渲染失败时的兜底视图 |
@@ -61,16 +62,16 @@
 
 1. HACS → 右上角 ⋮ → **自定义存储库**
 2. 仓库地址填本仓库地址，类别选 **Lovelace / Dashboard**
-3. 搜索 `AMap Location Card` → 下载
+3. 搜索 `高德探路卡`（或 `AMap Scout`）→ 下载
 4. 刷新浏览器（清缓存）
 
-> 仓库根目录需包含 `hacs.json`、`package.json` 与 `amap-location-card.js`，本仓库已经具备。
+> 仓库根目录需包含 `hacs.json`、`package.json` 与 `ha-amap-scout.js`，本仓库已经具备。
 
 ### 方式二：手动安装
 
-1. 把 `amap-location-card.js` 复制到 HA 配置目录的 `config/www/` 下（若无 `www` 目录请新建）
+1. 把 `ha-amap-scout.js` 复制到 HA 配置目录的 `config/www/` 下（若无 `www` 目录请新建）
 2. 设置 → 仪表盘 → 右上角 ⋮ → **资源** → 添加资源
-   - URL：`/local/amap-location-card.js`
+   - URL：`/local/ha-amap-scout.js`
    - 类型：**JavaScript 模块**
 3. 刷新浏览器
 
@@ -80,9 +81,33 @@
 
 ```yaml
 resources:
-  - url: /local/amap-location-card.js
+  - url: /local/ha-amap-scout.js
     type: module
 ```
+
+---
+
+## 命名与迁移（v1.1.0 改名）
+
+这张卡片叫 **高德探路卡（AMap Scout）**。`scout` 是侦察兵 / 探路者 —— **以实体为据点向外侦察周边设施，
+再带你去那儿**，正好说清它和一堆「通用高德地图卡片」的区别（生态里 `amap-card`、`cn-map-card`、
+`gaode-map` 已经把「地图」这个词占满了，再叫地图卡只会被淹没）。
+
+| 位置 | 值 |
+| --- | --- |
+| GitHub 仓库 | `lonyii/ha-amap-scout` |
+| 主文件 | `ha-amap-scout.js` |
+| 卡片类型 | `custom:amap-scout` |
+| 卡片选择器显示名 | 高德探路 · AMap Scout |
+
+**从 v1.0.x 升级，YAML 一行都不用改**：
+
+- 旧卡片类型 `custom:amap-location-card` **仍然注册**（内部是同一实现的子类别名），
+  老 dashboard、老编辑器都能继续用；编辑器也不会把你写的旧 type 悄悄换成新的；
+- 只有**资源文件路径**变了（`/local/amap-location-card.js` → `/local/ha-amap-scout.js`）：
+  在「设置 → 仪表盘 → 资源」里把 URL 改掉，或删掉旧的、按上面 [安装](#安装) 重新加一条；
+- 旧的 `amap-location-card.js` 可以删除，避免同一页面加载两份。HACS 自定义仓库的地址若还是旧名，
+  GitHub 会 301 到新仓库，但建议顺手在 HACS 里更新一下，免得以后取不到 release。
 
 ---
 
@@ -130,7 +155,7 @@ Lovelace 卡片运行在浏览器里，Key 一定会随请求发出。请务必�
 最小可用配置（YAML 模式）：
 
 ```yaml
-type: custom:amap-location-card
+type: custom:amap-scout
 entity: device_tracker.my_phone
 amap_key: 你的高德Key
 ```
@@ -138,7 +163,7 @@ amap_key: 你的高德Key
 一个完整的例子：
 
 ```yaml
-type: custom:amap-location-card
+type: custom:amap-scout
 title: 我的车
 entity: device_tracker.tesla_model_y
 amap_key: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
@@ -149,8 +174,6 @@ radius_mode: auto          # 搜索范围 = 屏幕上的可视矩形
 auto_radius_basis: cover   # 外接半径覆盖整个矩形 + 裁掉矩形外的结果
 auto_radius_max: 5000
 show_charging: true
-show_charging_price: true
-show_charging_available: true
 show_toilet: true
 icon_entity: mdi:car-electric
 icon_charging: mdi:ev-station
@@ -274,10 +297,8 @@ map_height: "100%"                     # 跟随父容器高度（panel 视图 / 
 | `auto_radius_max` | number | `5000` | 自动范围上限（米），100–50000，防止缩得很远时范围撑得过大。屏幕矩形本身超过上限时以矩形为准，保证四角不漏 |
 | `show_charging` | boolean | `true` | 启用充电桩检索 |
 | `charging_type` | string | `011100` | 充电设施 POI 类型码（可改） |
-| `show_charging_price` | boolean | `true` | 充电桩弹窗显示电价 |
-| `show_charging_available` | boolean | `true` | 充电桩弹窗显示可用桩数 |
 | `show_toilet` | boolean | `true` | 启用公共厕所检索 |
-| `toilet_type` | string | `140306` | 公共厕所 POI 类型码（可改） |
+| `toilet_type` | string | `200300` | 公共厕所 POI 类型码（高德官方分类「公共设施;公共厕所」；旧版本误写为 140306，会让公厕永远搜不到，v1.0.12 起自动纠正） |
 | `max_poi` | number | `20` | 每类最多显示条数 1–25 |
 | `icon_entity` | string | `mdi:crosshairs-gps` | 实体图标 |
 | `icon_charging` | string | `mdi:ev-station` | 充电桩图标 |
@@ -289,9 +310,6 @@ map_height: "100%"                     # 跟随父容器高度（panel 视图 / 
 | `poi_cache_ttl` | number | `300` | 周边检索缓存秒数，`0` = 关闭缓存 |
 | `api_min_interval` | number | `400` | 两次高德请求最小间隔（ms），节流防抖 |
 | `refresh_interval` | number | `60` | 实体持续移动时的最小刷新间隔（秒） |
-| `price_fields` | string | 内置候选 | 电价字段映射，逗号分隔，如 `biz_ext.charge_price,biz_ext.price` |
-| `available_fields` | string | 内置候选 | 可用桩数字段映射 |
-| `total_fields` | string | 内置候选 | 总桩数字段映射 |
 | `show_debug` | boolean | `false` | 状态栏显示请求数 / 缓存命中 / 失败数 |
 
 ---
@@ -402,6 +420,10 @@ locations=999,999  →  {"status":"1","info":"ok","infocode":"10000","locations"
 - **实体移动**（HA 推送新定位）→ 视野自动跟随回实体 → 检索基点自然回到实体周边；
 - `fixed` 模式不受影响，始终围绕实体坐标检索。
 
+> **距离从实体坐标起算**（v1.0.13）：检索基点可以跟着视野走，但列表与弹窗里的「距离」
+> 一律用 `haversine(实体, POI)` 重新计算，**不采用高德返回的 `distance`**（那个是相对检索基点的）。
+> 拖走地图后同一家充电站的距离不会莫名其妙变大，排序也按与实体的距离升序。
+
 ### 搜索范围 = 浏览者屏幕上的矩形
 
 高德周边检索（`/v3/place/around`）只接受圆形半径，但用户要的是「我这块屏幕上能看到的范围」——
@@ -455,9 +477,9 @@ locations=999,999  →  {"status":"1","info":"ok","infocode":"10000","locations"
 | 矩形范围检索（高德只支持圆形） | 外接半径检索 + `_fetchPois()` 里按 `_pinInView()` 裁剪 |
 | 结果点位不超出底图范围 | 上述裁剪保证 0 出界；`fixed` 模式仍有 `_checkPinsVisible()` / `_fitAllPins()` 兜底 |
 | 充电桩开关 + `types=011100` | `show_charging` / `charging_type` |
-| 返回距离、位置、名称、电价、可用桩数 | `buildPoiView()` + `poiPopupHtml()` |
-| 电价独立子开关 | `show_charging_price` |
-| 公厕开关 + `types=140306` | `show_toilet` / `toilet_type` |
+| 返回距离（**从实体坐标起算**）、位置、名称 | `buildPoiView()` / `_poiPopupHtml()` |
+| 充电桩面板不显示电价 / 可用桩数（高德不提供，v1.0.13 移除） | — |
+| 公厕开关 + `types=200300` | `show_toilet` / `toilet_type` |
 | API 节流防抖，失败静默提示不炸卡 | `RateLimiter` + `_pending` 去重 + `_showNotice()` |
 | 高德 JS API 底图（不用 HA 默认地图） | `amapLoader.load()` + `_createAMap()` |
 | 分层标记 + 自定义主图标 | `_renderPins()` |
@@ -475,23 +497,18 @@ locations=999,999  →  {"status":"1","info":"ok","infocode":"10000","locations"
 
 ## 重要限制与合规提醒
 
-### 1. 高德 POI **不保证**返回电价与可用桩数
+### 1. 电价 / 可用桩数：高德不提供，卡片已不再展示
 
-这是必须说清楚的一点。实测与官方文档确认：
+实测与官方文档确认：`/v3/place/around` 的 `biz_ext` **官方未定义子字段**，
+充电站（`011100`）既不返回电价、也不返回空闲桩数。
 
-- `/v3/place/around` 的 `biz_ext`（深度信息）**官方文档未定义子字段**；
-- 官方仅说明 `rating`（评分）与 `cost`（人均消费）出现在**餐饮 / 酒店 / 景点 / 影院**类 POI；
-- **充电站（`011100`）没有官方电价与空闲桩数字段**。
+v1.0.12 及更早的版本用一组候选字段名去「猜」，结果长期只能显示「暂无数据」，
+还在面板里白占两行。**v1.0.13 起整块移除**：充电桩面板只保留名称 / 距离 / 地址，
+与公厕一致；相应配置项（`show_charging_price`、`show_charging_available`、
+`price_fields`、`available_fields`、`total_fields`）一并删除，旧配置里留着也会被忽略。
 
-因此本卡片的做法是：
-
-1. 请求带 `extensions=all`；
-2. 用一组候选字段名依次探测 `biz_ext`（内置 15 个候选，如 `charge_price`、`price`、`available`、`surplus` …）；
-3. 取到就展示，取不到就显示「暂无数据」并在弹窗中给出提示，**不报错、不空白**；
-4. 如果你的 Key 或账号确实能拿到自定义字段，用 `price_fields` / `available_fields` / `total_fields` 直接指定字段路径即可。
-
-> 想要**稳定**的电价与空位数，需要接入充电运营商开放平台（特来电 / 快电 / 云快充等）或自建数据源，
-> 高德本身不是这类数据的提供方。本卡片已把展示层解耦，接第三方只需替换 `buildPoiView()` 里的取值逻辑。
+> 想要稳定的电价与空位数，需要接入充电运营商开放平台（特来电 / 快电 / 云快充等）
+> 或自建数据源 —— 高德不是这类数据的提供方，卡片不会为了凑字段去编造接口。
 
 ### 2. 配额
 
@@ -544,7 +561,7 @@ HA 官方 iOS App 用的是 **WKWebView**，它和 Safari 同一个内核但不�
 点一下会把下面这些信息写进剪贴板（App 里也能用），直接粘贴反馈即可定位：
 
 ```
-amap-location-card v1.0.11
+ha-amap-scout v1.1.0
 UA：（完整 UA，可判断是否 App 内嵌 WebView）
 环境：HA App / 内嵌 WebView | 浏览器
 屏幕：390×844 @3x
@@ -617,6 +634,7 @@ JS API：v2.0 · https://webapi.amap.com/maps
 
 | 现象 | 可能原因与处理 |
 | --- | --- |
+| **升级到 v1.1.0 后卡片报「Custom element doesn't exist: amap-scout」** | 只是**资源路径**没换：主文件已从 `amap-location-card.js` 改名为 `ha-amap-scout.js`，去「设置 → 仪表盘 → 资源」把 URL 改成 `/local/ha-amap-scout.js`（或删掉旧的重新加）。卡片 `type` 不用改 —— 旧的 `custom:amap-location-card` 仍然注册 |
 | 提示「高德 Key 无效或未开通该服务」 | Key 填错或不支持 Web 服务，请在控制台确认该 Key 的可用服务 |
 | 提示「缺少安全密钥」/ `INVALID_USER_SCODE` | 底图需要：填 `security_js_code`（控制台「Key 详情」里的安全密钥） |
 | 底图不出但点位正常 | 说明该 Key 不是「Web 端（JS API）」类型，或底图脚本被拦截 → 卡片已降级为简化视图，**看提示条里的具体原因**，详见 [底图加载不出来](#底图加载不出来先看提示条说了什么) |
@@ -637,13 +655,15 @@ JS API：v2.0 · https://webapi.amap.com/maps
 | **点 POI 里的「高德导航 / 地图标注」时，既开了新标签页、原页面又被顶掉一次（双跳）** | v1.0.8 已修。旧实现用 `window.open(url,'_blank','noopener')` 的返回值判断是否被拦截，但按 HTML 规范**带 `noopener` 时该调用一律返回 `null`**（新标签页其实已经开出来了），于是又走了 `location.href` 兜底 → 双跳。现在新标签分支只用临时 `<a target="_blank" rel="noopener noreferrer">`（原生 target 语义，用完即移除），**完全不写 `location.href`**，也不再依赖 `window.open` 的返回值。更新到 v1.0.8 即可 |
 | **点「编辑仪表盘」后地图还是满屏，HA 的编辑按钮被顶到屏幕外** | v1.0.9 已修：编辑模式的视图标签栏是 `fixed` 覆盖层，卡片的 `rect.top` 仍是 0，旧逻辑以为「上方没东西」继续铺满。现在会从视口顶往下实测被盖住的高度并扣掉，底部再留 `env(safe-area-inset-bottom) + 8px`；退出编辑模式后高度自动长回去（`hass` 更新 + ResizeObserver + 1.5 秒巡检三条触发路径） |
 | **点右下角 `◎ 回到定位`没反应** | v1.0.10 已修。旧实现直接复用「跟随/锁定」的自动逻辑 `_applyView`：① 视图被锁定时（配置 `view_mode: locked`，或在列表头点成「已锁定」）它**直接 return**，按钮等于死键；② 瓦片/简化底图只在首次应用视野时设缩放，之后点按钮不会恢复缩放；③ 列表展开或铺满高度重算改了容器尺寸、高德还按旧尺寸算中心，会偏半个屏幕。现在 `◎` 走独立的 `_recenter()`：任何模式都回到定位点（锁定时回 `locked_center`）、恢复 `follow_zoom`、清掉 15 秒暂停、必要先 `resize()`，状态标签闪「已回到定位」给反馈；高德实例彻底废掉时会顺手重建。**同时修了瓦片/简化底图拖不动**（手势层挡住了简化视图自己的 pointer 事件），否则「回到定位」没有参照物、看着也像无效 |
+| **拖走地图后，同一家充电站的距离突然变大了** | v1.0.13 已修：旧实现直接显示高德返回的 `distance`，它相对「检索基点（视野中心）」计算。现在距离统一从**实体坐标**用 haversine 重算，拖动、缩放都不再影响数值 |
+| **公共厕所一直没有结果（充电桩正常）** | v1.0.12 已修：旧版本把公厕分类码写成了 `140306`，而高德官方分类里「公共设施;公共厕所」是 **`200300`**（实测 `140306` 返回 `count=0`，无论哪个城市都搜不到）。现在默认值改为 `200300`，且历史配置里存过 `140306` 的会自动纠正，不用改 dashboard |
 | **定位点没有变成朝向箭头** | 确认实体属性里确实有 `heading`（也认 `course` / `bearing`），且是 0~360 的数值；属性缺失或非法时按普通图标显示，这是预期行为。另外若自定义了 `icon_entity`，箭头会画在圆外一圈而不是替换图标 |
 | **打开配置面板后每隔两三秒整页闪一下 / 输入框失焦、刚填的值被清掉** | 已修复（v1.0.1）：编辑器等 `ha-textfield` / `ha-entity-picker` 注册后升级原生控件，旧逻辑只要其中一个存在就重建表单，在 HA 里（`ha-entity-picker` 按需加载、常常一直不注册）会变成每 2.5 秒无限重建。现在按「已渲染的能力档位」升级，同一档只升一次，且正在输入时推迟到失焦 |
 | **定位十字和实体标记对不上 / 拖动地图后准星还在原地** | 已修复：简化视图的十字准星与半径圈改为画在实体投影位置上，跟着实体走 |
 | 标记溢出到地图外面，盖住了页面 | 已修复：地图容器加了 `overflow: hidden`，标记与弹窗一律裁剪在地图框内 |
 | 自动跟随刚点完「刷新」就自己停了 | 已修复：程序化改视野（自动跟随 / 回到定位）不再被误判成「用户拖动」，不会自我暂停 15 秒 |
 | 提示「坐标转换返回越界坐标 / 偏差过大」 | 高德返回了不可信结果，卡片已主动丢弃并降级。通常是配额或 Key 权限异常，看同一条提示里的 infocode |
-| 充电桩电价一直显示「暂无数据」 | 高德不返回该字段，见 [重要限制](#1-高德-poi-不保证返回电价与可用桩数) |
+| 充电桩面板没有电价 / 可用桩数 | 有意为之：高德不提供这两个字段，v1.0.13 起整块移除，见 [重要限制](#1-电价--可用桩数高德不提供卡片已不再展示) |
 | 卡片显示红框报错「请指定 entity」 | 配置里 `entity` 为空 |
 | 拖动地图后不再自动跟随 | 有意设计：暂停跟随 15 秒，展开列表后点「恢复跟随」可立即恢复 |
 
@@ -701,16 +721,17 @@ JS API：v2.0 · https://webapi.amap.com/maps
 
 ```bash
 # 语法检查（CI 里跑的就是这一句）
-node --check amap-location-card.js
+node --check ha-amap-scout.js
 ```
 
 完整测试脚本（`.smoke-test.cjs` / `.dom-test.cjs` / `.demo-check.cjs` / `.geo-audit.cjs`）
 **仅本地保留，不随仓库发布**。本地运行方式：
 
 ```bash
-node .smoke-test.cjs   # 143 项：坐标校验 / 距离 / 缓存 / 节流 / POI 解析 / 字段探测 / 链接构造 / 降级链 / 转换响应侧校验 / infocode 映射 / 底图失败诊断 / 投影 / 半径配置
-node .dom-test.cjs     # 231 项：jsdom 真实渲染 —— 两种地图分支 / 标记 / 弹窗 / 列表 / 事件委托 / 编辑器（含控件升级不得定时重建）/ 自动半径与拖动重搜 / 转换异常降级 / 建图抛错 / 联网自动重试 / 生命周期（需 npm i jsdom）
-node .demo-check.cjs   # 77 项：demo 页 DOM 引用完整性、预填 Key 与坐标、脚本语法、配置项拼写、失败可排查性
+node .smoke-test.cjs   # 222 项：坐标校验 / 距离 / 缓存 / 节流 / POI 解析 / 链接构造 / 降级链 / 转换响应侧校验 / infocode 映射 / 底图失败诊断 / 投影 / 半径配置 / 朝向箭头 / 命名与旧 tag 兼容
+node .dom-test.cjs     # 375 项：jsdom 真实渲染 —— 两种地图分支 / 标记 / 弹窗 / 列表 / 事件委托 / 编辑器（含控件升级不得定时重建）/ 自动半径与拖动重搜 / 转换异常降级 / 建图抛错 / 联网自动重试 / 回到定位 / heading 箭头 / 旧 tag 别名 / 生命周期（需 npm i jsdom）
+node .demo-check.cjs   # 81 项：demo 页 DOM 引用完整性、预填 Key 与坐标、脚本语法、配置项拼写、失败可排查性
+node .geo-audit.cjs    # 几何审计：自动半径内切 / 外接、结果是否出框，退出码非 0 即几何逻辑坏了
 ```
 
 测试在 Node / jsdom 中桩掉浏览器全局后加载**同一份源码**，因此测的就是发布的那份文件，
@@ -732,15 +753,15 @@ node .demo-check.cjs   # 77 项：demo 页 DOM 引用完整性、预填 Key 与�
 Windows 上直接 **双击 `push.cmd`** 也行（自动定位 Git Bash，跑完停住让你看结果）。
 `.cmd` 必须用 CRLF 换行，`.gitattributes` 已固定该规则，`push.sh` 每次运行也会自动纠正。
 
-发布白名单：`amap-location-card.js`、`README.md`、`hacs.json`、`package.json`、
+发布白名单：`ha-amap-scout.js`、`README.md`、`hacs.json`、`package.json`、
 `.gitignore`、`.github/`。`demo.html` 与测试脚本被 `.gitignore` 挡在仓库外
 （demo 内含本地 Key，绝不外发）。
 
 ### 目录结构
 
 ```
-ha-amap-location-card/        # GitHub 仓库（只含发布文件）
-├── amap-location-card.js     # 卡片本体（唯一交付物，单文件免构建）
+ha-amap-scout/                # GitHub 仓库（只含发布文件）
+├── ha-amap-scout.js          # 卡片本体（唯一交付物，单文件免构建）
 ├── hacs.json                 # HACS 元数据
 ├── package.json
 ├── README.md

@@ -1,8 +1,8 @@
 {
-  "name": "amap-location-card",
-  "version": "1.0.9",
-  "description": "Home Assistant Lovelace 卡片：高德地图底图 + 实体定位 + WGS84→GCJ02 纠偏 + 周边充电桩/公共厕所检索",
-  "main": "amap-location-card.js",
+  "name": "ha-amap-scout",
+  "version": "1.1.0",
+  "description": "Home Assistant Lovelace 卡片：以实体为圆心的高德地图 —— 定位朝向 + WGS84→GCJ02 纠偏 + 周边充电桩/公厕检索 + 一键导航",
+  "main": "ha-amap-scout.js",
   "license": "MIT",
   "keywords": [
     "home-assistant",
@@ -10,20 +10,21 @@
     "hacs",
     "custom-card",
     "amap",
+    "amap-scout",
     "gaode",
     "map",
     "charging-station"
   ],
   "scripts": {
-    "check": "node --check amap-location-card.js"
+    "check": "node --check ha-amap-scout.js"
   },
   "files": [
-    "amap-location-card.js",
+    "ha-amap-scout.js",
     "hacs.json",
     "README.md"
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/lonyii/ha-amap-location-card.git"
+    "url": "https://github.com/lonyii/ha-amap-scout.git"
   }
 }

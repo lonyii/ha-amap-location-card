@@ -1,6 +1,6 @@
 {
-  "name": "AMap Location Card",
-  "filename": "amap-location-card.js",
+  "name": "高德探路卡 · AMap Scout",
+  "filename": "ha-amap-scout.js",
   "content_in_root": true,
   "render_readme": true
 }

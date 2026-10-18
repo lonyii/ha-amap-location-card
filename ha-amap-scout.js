@@ -1,6 +1,6 @@
 /* =============================================================================
- *  AMap Location Card  —  Home Assistant 自定义 Lovelace 卡片
- *  高德地图定位卡片：实体定位 + WGS84→GCJ02 转换 + 周边检索（充电桩 / 公厕）
+ *  AMap Scout · 高德探路卡  —  Home Assistant 自定义 Lovelace 卡片
+ *  以实体为圆心的高德地图：定位朝向 + WGS84→GCJ02 转换 + 周边检索（充电桩 / 公厕）
  * -----------------------------------------------------------------------------
  *  设计要点
  *   · 单文件 ES Module，零构建依赖（HACS / www 目录直接可用）
@@ -16,9 +16,14 @@
  *   · iPhone Safari：touch-action 手势治理、固定 px 高度、WebGL 探测、点击兜底
  * ============================================================================= */
 
-const ALC_VERSION = '1.0.12';
-const ALC_CARD_TAG = 'amap-location-card';
-const ALC_EDITOR_TAG = 'amap-location-card-editor';
+const ALC_VERSION = '1.1.0';
+const ALC_CARD_TAG = 'amap-scout';
+const ALC_EDITOR_TAG = 'amap-scout-editor';
+
+/* v1.1.0 改名前的旧 tag，继续注册成别名：老 dashboard 里的 type 一行都不用改 */
+const ALC_LEGACY_CARD_TAG = 'amap-location-card';
+const ALC_LEGACY_EDITOR_TAG = 'amap-location-card-editor';
+const ALC_LEGACY_CARD_TYPES = ['custom:' + ALC_LEGACY_CARD_TAG, 'custom:' + ALC_CARD_TAG];
 
 const AMAP_REST_BASE = 'https://restapi.amap.com';
 const AMAP_JS_API_BASE = 'https://webapi.amap.com/maps';
@@ -774,7 +779,7 @@ async function diagnoseJsApiFailure(err) {
   // 失败详情一律打到控制台，便于用户直接复制排查（不依赖 show_debug）
   try {
     console.warn(
-      `[amap-location-card] 高德底图加载失败（${(err && err.code) || 'UNKNOWN'}）：${(err && err.message) || ''}\n` +
+      `[amap-scout] 高德底图加载失败（${(err && err.code) || 'UNKNOWN'}）：${(err && err.message) || ''}\n` +
       `  请求地址：${(err && err.safeUrl) || `${AMAP_JS_API_BASE}?v=${AMAP_JS_VERSION}`}\n` +
       `  域名探测：${AMAP_JS_API_HOST} ${probe === 'reachable' ? '可达' : (probe === 'unreachable' ? '不可达' : '未能探测')}`
     );
@@ -805,8 +810,11 @@ async function diagnoseJsApiFailure(err) {
  *   只有 _refresh 里对实体坐标调用 convertToGcj02（唯一允许的转换入口）。
  */
 
-/** 判断当前是否处于 Mock 调试模式（demo.html 使用） */
-const alcMock = () => (typeof window !== 'undefined' && window.__AMAP_LOCATION_CARD_MOCK__) || null;
+/** 判断当前是否处于 Mock 调试模式（demo.html 使用）。旧钩子名继续识别，v1.1.0 改名不影响老 demo */
+const alcMock = () => {
+  if (typeof window === 'undefined') return null;
+  return window.__ALC_MOCK__ || window.__AMAP_LOCATION_CARD_MOCK__ || null;
+};
 
 /** 高德 POI → 内部结构。坐标为 GCJ-02，原样保留（见上文「坐标系契约」） */
 function normalizePoi(p) {
@@ -851,7 +859,7 @@ class AmapWebApi {
     if (debug !== undefined) this.debug = !!debug;
   }
 
-  _log(...args) { if (this.debug) console.debug('[amap-location-card]', ...args); }
+  _log(...args) { if (this.debug) console.debug('[amap-scout]', ...args); }
 
   async _fetch(path, params) {
     const url = new URL(AMAP_REST_BASE + path);
@@ -1067,7 +1075,7 @@ function iconHtml(spec, size, className = '') {
     style="font-size:${Math.round(px * 0.56)}px;width:${px}px;height:${px}px">${escapeHtml(s)}</span>`;
 }
 
-const ALC_NAV_SRC = 'amap-location-card';
+const ALC_NAV_SRC = 'ha-amap-scout';
 
 /** 高德地图标注页（可唤起 App） */
 function buildMarkerUrl({ lng, lat, name }) {
@@ -1713,7 +1721,7 @@ class AmapLocationCard extends HTMLElement {
 
   setConfig(config) {
     if (!config || !config.entity) {
-      throw new Error('amap-location-card：请在配置中指定 entity（一个带 latitude / longitude 属性的实体）');
+      throw new Error('高德探路卡：请在配置中指定 entity（一个带 latitude / longitude 属性的实体）');
     }
     const raw = JSON.stringify(config);
     if (raw === this._rawConfig) return;
@@ -3741,7 +3749,7 @@ class AmapLocationCard extends HTMLElement {
   /** 调试输出：仅当 show_debug 打开时打印（与 AmapWebApi._log 保持一致的前缀） */
   _log(...args) {
     if (!this._cfg || !this._cfg.show_debug) return;
-    try { console.debug('[amap-location-card]', ...args); } catch (e) { /* ignore */ }
+    try { console.debug('[amap-scout]', ...args); } catch (e) { /* ignore */ }
   }
 
   /** 是否跑在 iOS/安卓 App 的 WKWebView 里（诊断用，不参与任何渲染决策） */
@@ -3767,7 +3775,7 @@ class AmapLocationCard extends HTMLElement {
     const notices = Array.from((this._notices || new Map()).entries())
       .map(([id, n]) => `  · ${id}: ${n.text}`).join('\n') || '  · (无)';
     return [
-      `amap-location-card v${ALC_VERSION}`,
+      `ha-amap-scout v${ALC_VERSION}`,
       `时间：${new Date().toISOString()}`,
       `UA：${navigator.userAgent}`,
       `环境：${this._isInAppWebView() ? 'HA App / 内嵌 WebView' : '浏览器'}`,
@@ -3801,7 +3809,7 @@ class AmapLocationCard extends HTMLElement {
   /** 把诊断信息复制到剪贴板（iOS WKWebView 里 navigator.clipboard 可能被拒 → 退回 execCommand） */
   async _copyDiagnostics() {
     const text = this._diagText();
-    try { console.warn('[amap-location-card] 诊断信息\n' + text); } catch (e) { /* ignore */ }
+    try { console.warn('[amap-scout] 诊断信息\n' + text); } catch (e) { /* ignore */ }
     const done = () => this._showNotice('diag', 'info', '诊断信息已复制，可直接粘贴给开发者排查。');
     try {
       if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -4327,7 +4335,9 @@ class AmapLocationCardEditor extends HTMLElement {
       if (k === 'type') return;
       out[k] = v;
     });
-    out.type = 'custom:amap-location-card';
+    /* 保留调用方原本用的 type：老卡片写 custom:amap-location-card 就不会被悄悄换掉 */
+    const incoming = String((this._config && this._config.type) || '');
+    out.type = ALC_LEGACY_CARD_TYPES.indexOf(incoming) >= 0 ? incoming : 'custom:' + ALC_CARD_TAG;
     out.entity = this._config.entity || '';
 
     fireEvent(this, 'config-changed', { config: out });
@@ -4589,22 +4599,31 @@ ha-switch { width:auto; }
  *  14. 注册
  * ============================================================================= */
 
-if (!customElements.get(ALC_CARD_TAG)) customElements.define(ALC_CARD_TAG, AmapLocationCard);
-if (!customElements.get(ALC_EDITOR_TAG)) customElements.define(ALC_EDITOR_TAG, AmapLocationCardEditor);
+/* 新旧 tag 都注册，同一个实现：
+ * 老配置 type: custom:amap-location-card 继续可用，一行 YAML 都不用改。
+ * 注意 CustomElementRegistry 规范里**一个构造器只能注册一次**（第二次会抛
+ * NotSupportedError），所以旧 tag 必须挂一个子类别名，不能把同一个 class 注册两遍。 */
+function defineWithLegacyAlias(tag, legacyTag, cls) {
+  if (!customElements.get(tag)) customElements.define(tag, cls);
+  const base = customElements.get(tag) || cls;
+  if (!customElements.get(legacyTag)) customElements.define(legacyTag, class extends base {});
+}
+defineWithLegacyAlias(ALC_CARD_TAG, ALC_LEGACY_CARD_TAG, AmapLocationCard);
+defineWithLegacyAlias(ALC_EDITOR_TAG, ALC_LEGACY_EDITOR_TAG, AmapLocationCardEditor);
 
 window.customCards = window.customCards || [];
 if (!window.customCards.some((c) => c.type === ALC_CARD_TAG)) {
   window.customCards.push({
     type: ALC_CARD_TAG,
-    name: 'AMap Location Card',
-    description: '高德地图定位卡片：实体定位 + WGS84→GCJ02 纠偏 + 周边充电桩 / 公共厕所检索',
+    name: '高德探路 · AMap Scout',
+    description: '以实体为圆心的高德地图：定位朝向 + WGS84→GCJ02 纠偏 + 周边充电桩 / 公厕 + 一键导航',
     preview: false,
-    documentationURL: 'https://github.com/your-name/amap-location-card',
+    documentationURL: 'https://github.com/lonyii/ha-amap-scout',
   });
 }
 
 console.info(
-  `%c AMAP-LOCATION-CARD %c v${ALC_VERSION} `,
+  `%c AMAP-SCOUT %c v${ALC_VERSION} `,
   'color:#fff;background:#03a9f4;font-weight:700;border-radius:3px 0 0 3px;padding:2px 4px',
   'color:#03a9f4;background:#e3f2fd;font-weight:700;border-radius:0 3px 3px 0;padding:2px 4px'
 );
