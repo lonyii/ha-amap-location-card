@@ -16,7 +16,7 @@
  *   · iPhone Safari：touch-action 手势治理、固定 px 高度、WebGL 探测、点击兜底
  * ============================================================================= */
 
-const ALC_VERSION = '1.0.6';
+const ALC_VERSION = '1.0.7';
 const ALC_CARD_TAG = 'amap-location-card';
 const ALC_EDITOR_TAG = 'amap-location-card-editor';
 
@@ -71,6 +71,12 @@ const ALC_DEFAULTS = {
   // 高德 JS 底图渲染不出来时（iOS App 内嵌 WKWebView 常见）自动切「瓦片底图」：
   // 同一套高德栅格瓦片，绕过 JS API 直接画到 canvas，永不见白板。
   fallback_tiles: true,
+  // 底图类型：auto = 先试高德 JS 底图（失败自动切瓦片）；tiles = 跳过 JS 底图，直接画高德栅格瓦片
+  basemap: 'auto',
+  // 强制启用 WebGL。高德 JSAPI 取 WebGL 上下文时带了 failIfMajorPerformanceCaveat，
+  // 图形性能弱的环境（尤其是 iOS App 的 WKWebView）会直接拿不到上下文 → 底图一片空白。
+  // 官方解法就是在 JSAPI 脚本加载**之前**置 window.forceWebGL = true。
+  force_webgl: true,
   // 搜索范围圈默认不画：检索范围就是整张地图的可视区域，画圈只是多一层视觉噪音
   show_radius_circle: false,
   show_scale: true,
@@ -252,6 +258,15 @@ function haversine(lat1, lon1, lat2, lon2) {
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
 }
 
+/**
+ * 判断一条高德报错 / 容器提示是否属于「拿不到 WebGL / 浏览器版本过低」这一类。
+ * 这类问题换渲染方式（瓦片底图）能救，重试没用。
+ */
+function isWebGLError(msg) {
+  return /webgl|版本过低|浏览器版本/i.test(String(msg || ''));
+}
+
+/** 长度格式化：米 / 公里 */
 function formatDistance(m) {
   const n = toNum(m);
   if (n === null) return '—';
@@ -557,6 +572,33 @@ const amapLoader = {
   },
 
   /**
+   * 强制启用 WebGL —— **必须在 JSAPI 脚本加载之前置位**，否则高德内部已按
+   * `failIfMajorPerformanceCaveat:true` 取过上下文，改不动了。
+   *
+   * 为什么需要：高德 JSAPI 2.0 依赖 WebGL，取上下文时默认带 failIfMajorPerformanceCaveat，
+   * 「图形绘制性能较差」的环境就直接拿不到上下文 → 地图容器一片空白（不报错、也不一定有提示）。
+   * iOS App 的 WKWebView（尤其低电量模式 / 软件渲染）正是这种环境，而同一台机器的 Safari
+   * 却是好的 —— 用户看到的就是「Safari 正常、HA App 里没底图」。
+   * 高德官方给的解法：`window.forceWebGL = true`；2.0 另有增强开关 `forceWebGLBaseRender`。
+   *
+   * 只在全局还没有定义时置位，尊重宿主页面自己的设置。
+   */
+  forceWebGL() {
+    try {
+      if (typeof window === 'undefined') return;
+      if (window.forceWebGL === undefined) window.forceWebGL = true;
+      if (window.forceWebGLBaseRender === undefined) window.forceWebGLBaseRender = true;
+    } catch (e) { /* ignore */ }
+  },
+
+  /** 诊断用：当前是否处于「强制 WebGL」状态 */
+  webglForced() {
+    try {
+      return !!(typeof window !== 'undefined' && (window.forceWebGL || window.forceWebGLBaseRender));
+    } catch (e) { return false; }
+  },
+
+  /**
    * WebGL 可用性探测。
    *
    * 只用来「诊断 / 提示」，**不再作为是否加载底图的开关**（见 _ensureMap）。
@@ -614,7 +656,7 @@ const amapLoader = {
    * 加载高德 JS API 2.0
    * @returns {Promise<any>} 解析为 window.AMap
    */
-  load({ key, securityJsCode, plugins = ALC_JS_API_PLUGINS }) {
+  load({ key, securityJsCode, plugins = ALC_JS_API_PLUGINS, forceWebGL: needForceWebGL = true }) {
     if (this.isReady() && this._key === key) return Promise.resolve(window.AMap);
     if (this._promise && this._key === key) return this._promise;
 
@@ -627,6 +669,8 @@ const amapLoader = {
     }
 
     this._applySecurity(securityJsCode);
+    // 顺序很关键：forceWebGL 与 security 都必须在 <script> 插入之前落到 window 上
+    if (needForceWebGL) this.forceWebGL();
     this._key = key;
 
     this._promise = new Promise((resolve, reject) => {
@@ -1673,6 +1717,8 @@ class AmapLocationCard extends HTMLElement {
     cfg.fill_viewport = cfg.fill_viewport !== false;   // 默认 true，显式 false 才关
     cfg.map_height = parseMapHeight(cfg.map_height);  // null = 不启用（非法值静默忽略）
     cfg.fallback_tiles = cfg.fallback_tiles !== false; // 瓦片底图默认开（关掉就只剩网格占位）
+    cfg.force_webgl = cfg.force_webgl !== false;       // 默认强制 WebGL（iOS App 能否出底图的关键）
+    if (cfg.basemap !== 'tiles') cfg.basemap = 'auto';  // 只有显式 tiles 才跳过高德 JS 底图
     cfg.radius = clamp(toNum(cfg.radius) || 2000, 50, 50000);
     cfg.auto_radius_pad = clamp(toNum(cfg.auto_radius_pad) || 1, 0.2, 4);
     cfg.auto_radius_max = clamp(toNum(cfg.auto_radius_max) || 5000, 100, 50000);
@@ -2081,6 +2127,26 @@ class AmapLocationCard extends HTMLElement {
     this._applyView(true);
   }
 
+  /**
+   * 高德拿不到 WebGL 上下文时，会在容器里留下一句提示（「浏览器版本过低，请更换浏览器」
+   * 这类），既不抛异常也可能永远不发 complete。这里只扫地图容器自身的文本，
+   * 范围很小，不会误伤页面别处的文字。
+   */
+  _mapShowsGlError() {
+    const el = this._mapEl;
+    if (!el) return false;
+    let txt = '';
+    try {
+      txt = String(el.textContent || '');
+      if (!txt) {
+        // 部分版本把提示画在 canvas 里，文本层可能为空；退一步看整体 innerText
+        txt = String(el.innerText || '');
+      }
+    } catch (e) { return false; }
+    if (!txt) return false;
+    return isWebGLError(txt.slice(0, 400));
+  }
+
   /* ------------------------------------------------------ 搜索半径 */
 
   /** 自动半径取法：'cover'（外接，默认，覆盖整个可视矩形）| 'visible'（内切，只覆盖画面中间） */
@@ -2369,12 +2435,22 @@ class AmapLocationCard extends HTMLElement {
     const mock = alcMock();
     const jsKey = String(cfg.amap_js_key || '').trim() || String(cfg.amap_key || '').trim();
     const canJs = !!jsKey && !(mock && mock.noJsApi);
+
+    // 用户显式选了「瓦片底图」：直接跳过 JS API（WebGL 起不来的设备上这是最稳的路）
+    if (cfg.basemap === 'tiles') {
+      this._log('底图配置为 tiles：跳过 JS API，直接画高德栅格瓦片');
+      this._createFallbackMap();
+      this._mapMode = 'fallback';
+      this._resizeMap();
+      return this._mapMode;
+    }
+
     // WebGL 探测结果只做诊断记录，**不再决定要不要加载底图**：
     // HA iOS App 的 WKWebView 可能误报 false（见 amapLoader.hasWebGL 注释），
     // 一旦据此提前降级，用户看到的就是「iOS App 没有底图，Safari 正常」。
     // 现在一律先真的去加载，真不支持时高德会自己报错，我们再降级并给可操作提示。
     this._webglProbe = alcMock() ? !(mock && mock.noJsApi) : amapLoader.hasWebGL();
-    this._log(`底图准备：key=${jsKey ? '有' : '无'} webgl=${this._webglProbe} ua=${navigator.userAgent}`);
+    this._log(`底图准备：key=${jsKey ? '有' : '无'} webgl=${this._webglProbe} force=${cfg.force_webgl !== false} ua=${navigator.userAgent}`);
 
     if (canJs) {
       try {
@@ -2383,6 +2459,7 @@ class AmapLocationCard extends HTMLElement {
           key: jsKey,
           securityJsCode: cfg.security_js_code,
           plugins: ALC_JS_API_PLUGINS,
+          forceWebGL: cfg.force_webgl !== false,
         });
         // _createAMap 失败时会自行降级为简化视图并置 _mapMode='fallback'，
         // 这里不能无条件覆盖成 'amap'，否则地图实际是画布、状态却报「高德底图」
@@ -2450,11 +2527,17 @@ class AmapLocationCard extends HTMLElement {
         hint = '（安全密钥缺失或不正确：请在「高级：多 Key 与安全密钥」里填入控制台的 securityJsCode）';
       } else if (/USER_KEY|INVALID_USER/i.test(msg)) {
         hint = '（该 Key 可能不是「Web 端(JS API)」类型，可在高德控制台确认）';
-      } else if (/webgl/i.test(msg) || /WebGL/i.test(msg)) {
+      } else if (isWebGLError(msg)) {
         hint = '（该 WebView 未启用 WebGL。iOS 上多见于 App 内嵌浏览器，可换 Safari 打开，或在 iOS 设置里关闭「低电量模式」后重试）';
       }
-      this._showNotice('mapfail', 'error', `地图初始化失败：${msg}${hint}`, '重试', () => this._retryMap(),
-        { label: '复制诊断', action: () => this._copyDiagnostics() });
+      // WebGL 类问题在 App 里重试没有意义 → 直接给「换瓦片底图」当主按钮
+      if (isWebGLError(msg)) {
+        this._showNotice('mapfail', 'error', `地图初始化失败：${msg}，已先用瓦片底图顶上。`, '重试高清底图', () => this._retryMap(),
+          { label: '复制诊断', action: () => this._copyDiagnostics() });
+      } else {
+        this._showNotice('mapfail', 'error', `地图初始化失败：${msg}${hint}`, '重试', () => this._retryMap(),
+          { label: '复制诊断', action: () => this._copyDiagnostics() });
+      }
       this._createFallbackMap();
       this._mapMode = 'fallback';
       return false;
@@ -2477,9 +2560,26 @@ class AmapLocationCard extends HTMLElement {
       } else if (/USER_KEY|INVALID_USER/i.test(msg)) {
         keyHint = '（该 Key 可能不是「Web 端(JS API)」类型，可在高德控制台确认；周边检索与坐标转换不受影响）';
       }
+      // WebGL 类问题在 iOS App 里换掉 WebGL 渲染是唯一的出路 → 直接把按钮换成「换瓦片底图」
+      if (isWebGLError(msg)) {
+        this._showNotice('maperr', 'warn',
+          `地图渲染异常：${msg}（当前 WebView 拿不到 WebGL 上下文），已可改用瓦片底图。`, '换瓦片底图',
+          () => this._switchToTilesMap(),
+          { label: '复制诊断', action: () => this._copyDiagnostics() });
+        return;
+      }
       this._showNotice('maperr', 'warn', `地图渲染异常：${msg}${keyHint}，可点击「重试」重建地图。`, '重试', () => this._retryMap(),
         { label: '复制诊断', action: () => this._copyDiagnostics() });
     });
+    // 高德拿不到 WebGL 时不会走 error 事件，而是在容器里写一句「浏览器版本过低」之类的提示。
+    // 这种情况 complete 永远不会来，但也不一定等满 12 秒 —— 3.5 秒扫一次文本，命中就直接换瓦片。
+    clearTimeout(this._glTimer);
+    this._glTimer = setTimeout(() => {
+      if (this._mapReady || !this._map) return;
+      if (!this._mapShowsGlError()) return;
+      this._log('检测到高德提示「浏览器版本过低 / 不支持 WebGL」→ 换瓦片底图');
+      this._switchToTilesMap();
+    }, 3500);
     // 「自动跟随 / 回到定位」这类程序化改视野同样会触发 zoomstart/zoomend。
     // 若无条件记成用户操作，自动跟随会被自己关掉 15 秒 —— 必须放过这段窗口。
     this._programmaticAt = 0;
@@ -2784,7 +2884,7 @@ class AmapLocationCard extends HTMLElement {
     const center = this._initialCenter();
     this._fbMap = new CanvasFallbackMap(this._mapEl, {
       controls: false,   // 控件列由卡片统一提供（地图右下角），避免两套按钮重叠
-      tiles: this._cfg.fallback_tiles !== false,   // 没有 JS API 也铺真实高德瓦片
+      tiles: this._cfg.basemap === 'tiles' || this._cfg.fallback_tiles !== false,   // 没有 JS API 也铺真实高德瓦片
       zoom: this._cfg.view_mode === 'locked' ? this._cfg.locked_zoom : this._cfg.follow_zoom,
       centerLng: center[0],
       centerLat: center[1],
@@ -2835,6 +2935,7 @@ class AmapLocationCard extends HTMLElement {
   _teardownMap() {
     clearTimeout(this._mapTimeout);
     clearTimeout(this._mapTimeout2);
+    clearTimeout(this._glTimer);
     clearTimeout(this._radiusTimer);
     clearTimeout(this._suppressTimer);
     this._radiusTimer = null;
@@ -3402,6 +3503,9 @@ class AmapLocationCard extends HTMLElement {
       `地图模式：${this._mapMode || '未创建'} · 地图就绪：${this._mapReady ? '是' : '否'} · canvas 数：${canvas.length}`,
       `WebGL 探测：${this._webglProbe === undefined ? '未执行' : (this._webglProbe ? '通过' : '未通过')}`,
       `WebGL 渲染器：${amapLoader.webglInfo()}`,
+      `强制 WebGL：${cfg.force_webgl === false ? '关（配置）' : (amapLoader.webglForced() ? '开（window.forceWebGL）' : '未置位')}`,
+      `底图类型：${cfg.basemap === 'tiles' ? '瓦片底图（跳过 JS API）' : 'auto（先试 JS 底图）'}`,
+      `容器内 GL 提示：${this._mapShowsGlError() ? '有（浏览器版本过低 / WebGL 不可用）' : '无'}`,
       `Key：${jsKey ? `${jsKey.slice(0, 6)}…（${jsKey.length} 位，来源 ${String(cfg.amap_js_key || '').trim() ? 'amap_js_key' : 'amap_key'}）` : '未配置'}`,
       `安全密钥：${String(cfg.security_js_code || '').trim() ? '已配置' : '未配置'}`,
       `JS API：v${AMAP_JS_VERSION} · ${AMAP_JS_API_BASE}`,
@@ -3671,6 +3775,7 @@ const ALC_EDITOR_SECTIONS = [
       ] },
       { key: 'show_source_marker', label: '显示实体主图标', type: 'boolean' },
       { key: 'fallback_tiles', label: '无底图时用瓦片兜底', type: 'boolean', hint: '高德 JS 底图渲染不出来时（App 内嵌浏览器常见）自动改用同一套高德栅格瓦片，永不见白板；关掉则只在网格上显示点位' },
+      { key: 'basemap', label: '底图类型', type: 'select', options: [['auto', 'auto（先用高德 JS 底图，失败自动换瓦片）'], ['tiles', '只用瓦片底图（跳过 JS 底图，最稳）']], hint: 'iOS App 里底图一直空白、又不想折腾 WebGL 时，选「只用瓦片底图」即可 —— 同一套高德栅格瓦片，点位/检索/列表全都不变' },
       { key: 'show_toolbar', label: '显示缩放 / 回到定位按钮', type: 'boolean', hint: '关闭后地图右下角只留「列表」按钮' },
       { key: 'show_scale', label: '显示比例尺', type: 'boolean', dependsOn: { show_toolbar: true } },
       { key: 'click_action', label: '点击标记行为', type: 'select', options: [['popup', '弹出信息窗'], ['navigate', '直接唤起高德导航']] },
@@ -3686,6 +3791,7 @@ const ALC_EDITOR_SECTIONS = [
       { key: 'api_min_interval', label: '请求最小间隔（毫秒）', type: 'number', min: 0, max: 5000, hint: '节流防抖，避免触发高德 QPS 限流，默认 400' },
       { key: 'refresh_interval', label: '实体刷新最小间隔（秒）', type: 'number', min: 0, max: 3600, hint: '实体持续移动时，最少间隔多久重新转换坐标与检索，默认 60' },
       { key: 'gesture', label: '地图手势策略', type: 'select', options: [['map', '地图优先（推荐，防止 iOS 手势异常）'], ['scroll', '页面滚动优先']], hint: 'iOS Safari 上建议「地图优先」' },
+      { key: 'force_webgl', label: '强制启用 WebGL（iOS App 出底图的关键）', type: 'boolean', hint: '高德 JSAPI 取 WebGL 上下文时带了 failIfMajorPerformanceCaveat，图形性能弱的环境（iOS App 的 WKWebView 最典型）会直接拿不到上下文 → 底图一片空白。默认开：在加载 JSAPI 脚本前置 window.forceWebGL = true。只有确认它导致画面异常时才关。' },
       { key: 'show_debug', label: '在状态栏显示调试统计', type: 'boolean' },
       { key: 'price_fields', label: '电价字段映射', type: 'text', hint: '逗号分隔的字段路径，按顺序探测 biz_ext。留空使用内置候选。' },
       { key: 'available_fields', label: '可用桩数字段映射', type: 'text' },

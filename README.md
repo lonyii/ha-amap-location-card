@@ -237,6 +237,8 @@ map_height: "100%"                     # 跟随父容器高度（panel 视图 / 
 | `show_radius_circle` | boolean | `false` | 显示搜索半径圈。默认关闭：搜索范围就是整张地图的可视矩形，画圈只会多一层视觉噪音 |
 | `show_toolbar` | boolean | `true` | 显示地图右下角的「缩放 / 回到定位」按钮。关闭后只留「列表」按钮 |
 | `fallback_tiles` | boolean | `true` | **无底图时的瓦片兜底**（v1.0.5）：JS 底图 15 秒渲染不出瓦片（App 内嵌 WKWebView 常见）时，自动改用同一套高德栅格瓦片直接画到 canvas —— 地图照样能看，点位/列表/检索全不受影响。关闭后无底图时只显示网格 |
+| `basemap` | `auto` / `tiles` | `auto` | 底图类型（v1.0.7）。`auto`：先试高德 JS 底图，失败自动换瓦片；`tiles`：**从一开始就只用瓦片底图**，跳过 JS API（WebGL 起不来的设备上最稳，同一套高德栅格瓦片，点位/检索/列表不变） |
+| `force_webgl` | boolean | `true` | **强制启用 WebGL**（v1.0.7，iOS App 出底图的关键）：加载 JSAPI 脚本前自动置 `window.forceWebGL = true` + `forceWebGLBaseRender = true`，绕过高德默认的 `failIfMajorPerformanceCaveat` 检查（该检查在 iOS App 的 WKWebView 里会把底图直接判成空白）。仅当确认它导致画面异常时才关 |
 | `show_scale` | boolean | `true` | 显示比例尺 |
 | `radius_mode` | `auto` / `fixed` | `auto` | `auto` = 搜索范围 = 屏幕上的可视矩形（随容器尺寸与缩放自适应）；`fixed` = 用下面固定值 |
 | `radius` | number | `2000` | 固定搜索半径（米），50–50000，仅 `radius_mode: fixed` 时生效 |
@@ -501,11 +503,12 @@ HA 官方 iOS App 用的是 **WKWebView**，它和 Safari 同一个内核但不�
 
 | 现象 / 成因 | 卡片现在的处理 |
 | --- | --- |
+| **WebGL 被 failIfMajorPerformanceCaveat 拦掉（v1.0.7 根治的主因）**：高德 JSAPI 2.0 取 WebGL 上下文时默认带 `failIfMajorPerformanceCaveat`，「图形绘制性能较差」的环境会**直接拿不到上下文 → 底图一片空白**，不报错也不一定有提示。iOS App 的 WKWebView（低电量模式 / 软件渲染）正是这种环境，而同一台机器的 Safari 却是好的 | 加载 JSAPI **脚本之前**自动置 `window.forceWebGL = true`（高德官方解法）与增强开关 `forceWebGLBaseRender`（`force_webgl` 配置，默认开，诊断里可看到是否置位）。同时高德若在容器里留下「浏览器版本过低」之类提示，3.5 秒内就会被识别并**自动换成瓦片底图** |
 | **WebGL 探测误报**：未挂载到文档的 canvas 在部分 iOS 版本上拿不到 WebGL 上下文（Safari 里同样写法却是好的）。旧逻辑据此直接降级成简化视图 —— 表现就是「App 里没底图、Safari 正常」 | 探测改为**挂载 + 1×1 + 依次试 webgl2/webgl/experimental-webgl + 用完释放上下文**（iOS 的 WebGL 上下文配额很少，泄漏一个就可能让地图建不出来）；探测结果**只用于诊断**，真不支持时由高德自己报错再降级 |
 | **容器初始尺寸为 0**：App 恢复上次视图 / 卡片在隐藏 Tab 里创建，高德在 0×0 容器上建图不会请求瓦片，之后一直是空白 | `ResizeObserver` 检测到「0 → 有尺寸」时补一次 `map.resize()` **并重新应用视野**；12 秒超时也会先做一次同样的自愈再提示 |
 | **从后台回来 WebGL 上下文丢失**（画布在、瓦片没了） | 监听 `webglcontextlost` → 提示「重试」；`visibilitychange` 回到前台时若仍有异常提示，自动重建一次地图 |
 | **偶发脚本/网络失败**（App 内网络切换、DNS 缓存） | 提示条「重试」重建；联网（`online`）后也会自动重试 |
-| **以上全都没救回来**（JS API 在 App 里彻底起不来） | **自动换成「瓦片底图」**（v1.0.5）：同一套高德栅格瓦片绕过 JS API 直接画到 canvas，永不见白板；提示条保留「重试高清底图」与「复制诊断」 |
+| **以上全都没救回来**（JS API 在 App 里彻底起不来） | **自动换成「瓦片底图」**（v1.0.5）：同一套高德栅格瓦片绕过 JS API 直接画到 canvas，永不见白板；提示条保留「重试高清底图」与「复制诊断」。也可以直接把 `basemap` 配成 `tiles`，从一开始就跳过 JS 底图 |
 
 ### 还不显示？一键复制诊断
 
@@ -513,13 +516,15 @@ HA 官方 iOS App 用的是 **WKWebView**，它和 Safari 同一个内核但不�
 点一下会把下面这些信息写进剪贴板（App 里也能用），直接粘贴反馈即可定位：
 
 ```
-amap-location-card v1.0.5
+amap-location-card v1.0.7
 UA：（完整 UA，可判断是否 App 内嵌 WebView）
 环境：HA App / 内嵌 WebView | 浏览器
 屏幕：390×844 @3x
 卡片容器：390×700          ← 0×0 说明是布局问题
 地图模式：amap | fallback · 地图就绪：是/否 · canvas 数
 WebGL 探测：通过/未通过 · 渲染器：Apple GPU / unavailable
+强制 WebGL：开（window.forceWebGL）· 容器内 GL 提示：无
+底图类型：auto（先试 JS 底图）| 瓦片底图（跳过 JS API）
 Key：xxxxxx…（长度，来源 amap_key / amap_js_key）
 安全密钥：已配置/未配置
 JS API：v2.0 · https://webapi.amap.com/maps
@@ -596,7 +601,7 @@ JS API：v2.0 · https://webapi.amap.com/maps
 | **结果点位跑到地图框外面去了** | 不该再出现：`auto` 模式是「外接半径检索 + 矩形裁剪」，只会渲染屏幕内的点。若仍复现，请更新到最新版本；`fixed` 模式下范围是显式指定的，出画时点提示条上的「铺满显示」即可 |
 | **宽屏时两边明明有充电桩却搜不到** | 说明 `auto_radius_basis` 被设成了 `visible`（内切圆只覆盖画面中间）。改回默认的 `cover` 即可按整屏矩形搜索 |
 | **iOS App 里底图空白但点位还在** | v1.0.5 起会自动换成「瓦片底图」（同一套高德瓦片、不经 JS API），不会再有白板。若看到的是网格（而非地图），检查 `fallback_tiles` 是否被关掉，或网络是否拦了 `*.is.autonavi.com` |
-| **只有 HA iOS App 里没有底图，Safari 和电脑正常** | 见「[iOS App 里没有底图](#ios-app-里没有底图wkwebview-差异)」：v1.0.3 起不再因 WebGL 探测失败提前降级，并修了「容器 0 尺寸 / 后台回来上下文丢失」两条路径。若仍有问题，点提示条上的「复制诊断」把信息发出来 |
+| **只有 HA iOS App 里没有底图，Safari 和电脑正常** | v1.0.7 已把高德官方的 `window.forceWebGL = true` 修法内置（JSAPI 默认带 `failIfMajorPerformanceCaveat`，WKWebView 里会直接拿不到 WebGL 上下文 → 底图空白），并会自动识别高德留下的「浏览器版本过低」提示换瓦片底图。若更新版本后仍空白，把 `basemap` 配成 `tiles` 可立刻有图；再点「复制诊断」把信息发出来（重点看「强制 WebGL」「WebGL 渲染器」「容器内 GL 提示」三行） |
 | **底图一直空白但列表有点位** | 点提示条「重试」；仍空白则点「复制诊断」看 `卡片容器` 是否为 0×0、`WebGL 探测` 是否为未通过 |
 | **地图拖不动 / 滚轮不缩放** | 本卡片用手势层接管了高德底图的全部交互（JSAPI 2.0 在 Shadow DOM 下的已知缺陷，见「已知问题」一节）。请更新到最新版本；若仍复现，确认浏览器未禁用 Pointer Events（iOS 13+/现代浏览器均支持） |
 | **缩放（双指捏合/滚轮）后定位点整体错位、和地图对不上** | 已修复：手势路径的 `setZoom` / `setCenter` 现在全部立即生效（带动画的调用在 iOS 上被逐帧打断后，标记层会与瓦片层脱节），且捏合改为**锚定双指中点**缩放（指下的地点不再滑走）。请更新到最新版本 |
