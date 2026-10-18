@@ -16,7 +16,7 @@
  *   · iPhone Safari：touch-action 手势治理、固定 px 高度、WebGL 探测、点击兜底
  * ============================================================================= */
 
-const ALC_VERSION = '1.0.9';
+const ALC_VERSION = '1.0.10';
 const ALC_CARD_TAG = 'amap-location-card';
 const ALC_EDITOR_TAG = 'amap-location-card-editor';
 
@@ -1185,6 +1185,7 @@ class CanvasFallbackMap {
     this._tileRaf = null;
     this.markers = [];
     this.onMarkerClick = opts.onMarkerClick || (() => {});
+    this.onBlankTap = opts.onBlankTap || (() => {});
     this.onViewChange = opts.onViewChange || (() => {});
     this.onZoom = opts.onZoom || (() => {});
     // 卡片已经在地图右下角放了统一控件列（回到定位 / + / − / 列表），
@@ -1307,6 +1308,22 @@ class CanvasFallbackMap {
       e.preventDefault();
       this.setZoom(this.zoom + (e.deltaY < 0 ? 1 : -1), false);
     }, { passive: false });
+
+    // 轻点空白 → 关弹窗（与高德底图模式对齐；之前事件被卡片手势层挡着，点空白关不掉）
+    let down = null;
+    h.addEventListener('pointerdown', (e) => {
+      down = (e.target.closest && e.target.closest('.alc-fm-marker, .alc-fm-controls, .alc-fm-popup'))
+        ? null : { x: e.clientX, y: e.clientY };
+    });
+    h.addEventListener('pointerup', (e) => {
+      const d = down;
+      down = null;
+      if (!d) return;
+      if (Math.hypot(e.clientX - d.x, e.clientY - d.y) > 8) return;   // 拖过就不算轻点
+      if (e.target.closest && e.target.closest('.alc-fm-marker, .alc-fm-controls, .alc-fm-popup')) return;
+      this.closePopup();
+      this.onBlankTap();
+    });
   }
 
   _pointerDistance() {
@@ -2640,6 +2657,7 @@ class AmapLocationCard extends HTMLElement {
     this._mapEl.innerHTML = '';
     const center = this._initialCenter();
     // 手势事件由卡片的 .alc-gesture 层接管，这里按手势策略设置它的 touch-action
+    this._els.gesture.style.pointerEvents = '';   // 高德底图：手势层重新接管（之前可能让给简化视图）
     this._els.gesture.style.touchAction = cfg.gesture === 'map' ? 'none' : 'pan-y';
     this._closeAmapPopup();
     this._markerIndex = new Map();   // 新地图实例：旧 Marker 已随旧图销毁，索引必须重建
@@ -3030,6 +3048,10 @@ class AmapLocationCard extends HTMLElement {
     if (this._fbMap) return;
     this._mapEl.innerHTML = '';
     this._mapEl.style.touchAction = 'none';
+    // 简化视图 / 瓦片底图自己绑了 pointer 手势（绑在 #alc-map 上），而卡片的手势接管层
+    // 默认盖在它上面（z-index:10）→ 事件全被手势层吞掉，表现为「瓦片底图拖不动、
+    // 捏合没反应、点标记不开弹窗」。这里让手势层让路，改由简化视图自己处理。
+    if (this._els && this._els.gesture) this._els.gesture.style.pointerEvents = 'none';
     const center = this._initialCenter();
     this._fbMap = new CanvasFallbackMap(this._mapEl, {
       controls: false,   // 控件列由卡片统一提供（地图右下角），避免两套按钮重叠
@@ -3041,10 +3063,11 @@ class AmapLocationCard extends HTMLElement {
       focusLat: this._gcj ? this._gcj.lat : null,
       radius: this._cfg.show_radius_circle ? this._currentRadius() : 0,
       onMarkerClick: (data) => this._onPinClick(data),
+      onBlankTap: () => this._closeAmapPopup(),
       onViewChange: () => { this._userPannedAt = Date.now(); this._renderStatus(); this._onViewportChanged(); },
       onZoom: () => this._onViewportChanged(),
     });
-    this._fbMap._recenterRequest = () => this._applyView(true);
+    this._fbMap._recenterRequest = () => this._recenter();
     this._renderPins();
   }
 
@@ -3110,6 +3133,9 @@ class AmapLocationCard extends HTMLElement {
     clearTimeout(this._listResizeTimer);
     clearTimeout(this._fillTimer1);
     clearTimeout(this._fillTimer2);
+    clearTimeout(this._flashTimer);
+    this._flashTimer = null;
+    this._statusFlash = null;
     if (this._fillRO) {
       try { this._fillRO.disconnect(); } catch (e) { /* ignore */ }
       this._fillRO = null;
@@ -3436,6 +3462,97 @@ class AmapLocationCard extends HTMLElement {
     this._viewInitialized = true;
   }
 
+  /**
+   * 右下角「回到定位」按钮：把视野拉回定位点，并恢复自动跟随。
+   *
+   * 为什么不能直接复用 _applyView(true)（旧实现就是这么写的，于是按钮经常「点了没反应」）：
+   * · locked 模式（配置成锁定视图，或列表头里点成「已锁定」）时 _applyView 走锁定分支，
+   *   而 _viewInitialized 早已是 true → 直接 return，什么都不做；
+   * · 瓦片/简化底图只在首次应用视野时设缩放，之后点按钮不会再恢复缩放级别；
+   * · 列表展开、铺满高度重算会改变地图容器尺寸，高德内部还按旧尺寸算中心，
+   *   直接 setZoomAndCenter 会把点算到旧视口中心（偏半个屏幕，看着像没回到位）。
+   * 所以这里单独一条「只要点了就必须看得见反应」的路径。
+   */
+  _recenter() {
+    const cfg = this._cfg;
+    if (!cfg) return false;
+    // 配置成「手动锁定视图」时，回到定位 = 回到锁定中心；其余情况回实体本身
+    const mode = this._viewOverride || cfg.view_mode;
+    const locked = parseLngLat(cfg.locked_center);
+    const zoom = clamp(toNum(mode === 'locked' ? cfg.locked_zoom : cfg.follow_zoom)
+      || (mode === 'locked' ? 15 : 16), 3, 19);
+    const target = (mode === 'locked' && locked)
+      ? locked
+      : (this._gcj ? [this._gcj.lng, this._gcj.lat] : locked);
+
+    // 点「回到定位」的意图就是回到自动跟随：解除手动锁定、清掉 15 秒暂停
+    this._viewOverride = null;
+    this._userPannedAt = 0;
+    this._viewInitialized = true;
+
+    let moved = false;
+    if (this._map && this._mapMode === 'amap') {
+      // 容器尺寸变了（列表展开 / 铺满高度重算）而高德还按旧尺寸算中心 → 先校准
+      try {
+        const size = this._map.getSize && this._map.getSize();
+        const wrap = this._els && this._els.mapWrap;
+        if (size && wrap && (Math.abs(size.getWidth() - wrap.clientWidth) > 2
+          || Math.abs(size.getHeight() - wrap.clientHeight) > 2)) {
+          this._map.resize();
+        }
+      } catch (e) { /* ignore */ }
+      if (target) {
+        this._programmaticAt = Date.now();   // 让 zoomend 知道这次不是用户拖的
+        try {
+          this._map.setZoomAndCenter(zoom, target, false, 300);
+          moved = true;
+        } catch (e) {
+          // 动画路径异常（个别 WebView 上 setZoomAndCenter 会抛）→ 退回瞬时设置
+          try { this._map.setCenter(target, true); this._map.setZoom(zoom, true); moved = true; } catch (e2) { /* ignore */ }
+        }
+      }
+    }
+    if (this._fbMap && target) {
+      try {
+        this._fbMap.setFocus(target[0], target[1]);
+        this._fbMap.setCenter(target[0], target[1]);
+        this._fbMap.setZoom(zoom, true, true);
+        moved = true;
+      } catch (e) { /* ignore */ }
+    }
+
+    if (moved) {
+      this._placeAmapPopup();     // 弹窗跟着锚点重新定位
+      this._onViewportChanged();  // 视野变了 → 自动半径模式重算检索范围
+      this._flashStatus('已回到定位');
+    } else if (!this._map && !this._fbMap) {
+      // 底图还没建起来（App 里加载失败后又被清掉）→ 顺手重建一次，别让按钮变成死键
+      this._refresh(true);
+      this._flashStatus('正在重新加载底图…');
+    } else if (this._map && this._mapMode === 'amap') {
+      // 高德实例在但两种调用都抛了（内部 canvas 已废）→ 重建一次
+      this._retryMap();
+      this._flashStatus('底图异常，正在重建…');
+    } else {
+      this._flashStatus('定位点尚未就绪');
+    }
+    this._renderStatus();
+    return moved;
+  }
+
+  /** 状态标签上闪一条短提示（1.6 秒后自动消失），给「点了但地图本来就在原位」一个反馈 */
+  _flashStatus(text) {
+    this._statusFlash = text || null;
+    this._renderStatus();
+    clearTimeout(this._flashTimer);
+    if (!text) return;
+    this._flashTimer = setTimeout(() => {
+      this._flashTimer = null;
+      this._statusFlash = null;
+      this._renderStatus();
+    }, 1600);
+  }
+
   /* -------------------------------------------------------- 弹窗内容 */
 
   _entityName() {
@@ -3586,7 +3703,7 @@ class AmapLocationCard extends HTMLElement {
       return;
     }
     if (toolbarAct === 'refresh') { if (this._api) this._api.clearCache(); this._refresh(true); return; }
-    if (toolbarAct === 'recenter') { this._applyView(true); return; }
+    if (toolbarAct === 'recenter') { this._recenter(); return; }
     if (toolbarAct === 'view') {
       const mode = this._viewOverride || this._cfg.view_mode;
       this._viewOverride = mode === 'follow' ? 'locked' : 'follow';
@@ -3785,9 +3902,9 @@ class AmapLocationCard extends HTMLElement {
     if (headBtn) headBtn.textContent = '收起';
 
     const bits = [];
+    if (this._statusFlash) bits.push(this._statusFlash);   // 「回到定位」等操作的即时反馈
     if (this._gcj) bits.push(`${this._gcj.lng.toFixed(4)}, ${this._gcj.lat.toFixed(4)}`);
-    bits.push(this._convertViaLabel());
-    const r = this._lastRadius || this._currentRadius();
+    bits.push(this._convertViaLabel());    const r = this._lastRadius || this._currentRadius();
     if (cfg.radius_mode === 'auto') {
       // auto = 把屏幕可视矩形当检索范围（外接半径 + 视口裁剪，等价于矩形检索）
       const how = this._radiusBasis() === 'cover' ? '整屏矩形' : '内切圆';
@@ -4427,7 +4544,8 @@ ha-card { overflow:hidden; }
 
 /* 简化视图 */
 .alc-fallback-map { --alc-fallback-bg:#eef2f6; --alc-fallback-grid:rgba(0,0,0,.07); --alc-accent:#03a9f4;
-  position:absolute; inset:0; overflow:hidden; background:var(--alc-fallback-bg); }
+  position:absolute; inset:0; overflow:hidden; background:var(--alc-fallback-bg); cursor:grab; }
+.alc-fallback-map:active { cursor:grabbing; }
 .alc-fm-canvas { position:absolute; inset:0; display:block; }
 .alc-fm-layer { position:absolute; inset:0; overflow:hidden; }
 .alc-fm-marker { position:absolute; left:0; top:0; cursor:pointer;
