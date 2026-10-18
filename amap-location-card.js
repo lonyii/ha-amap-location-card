@@ -16,7 +16,7 @@
  *   · iPhone Safari：touch-action 手势治理、固定 px 高度、WebGL 探测、点击兜底
  * ============================================================================= */
 
-const ALC_VERSION = '1.0.11';
+const ALC_VERSION = '1.0.12';
 const ALC_CARD_TAG = 'amap-location-card';
 const ALC_EDITOR_TAG = 'amap-location-card-editor';
 
@@ -102,11 +102,9 @@ const ALC_DEFAULTS = {
   auto_radius_pad: 1,             // 自动半径系数：1 = 恰好贴到可视边缘
   auto_radius_max: 5000,          // 自动半径上限（米），避免缩得很远时把检索范围撑爆
   show_charging: true,
-  show_charging_price: true,
-  show_charging_available: true,
   charging_type: '011100',
   show_toilet: true,
-  toilet_type: '140306',
+  toilet_type: '200300',
   max_poi: 20,
 
   /* 图标 */
@@ -126,30 +124,7 @@ const ALC_DEFAULTS = {
   api_min_interval: 400,          // 两次高德请求最小间隔（毫秒）
   refresh_interval: 60,           // 实体移动时的最小刷新间隔（秒）
   show_debug: false,
-
-  /* 电价 / 桩数 字段映射（留空使用内置候选，逗号分隔，支持 biz_ext.xxx 与顶层 xxx） */
-  price_fields: '',
-  available_fields: '',
-  total_fields: '',
 };
-
-/* 高德 POI 不保证返回电价与空闲桩数，这里给一组候选字段名逐个探测（可在配置里覆盖） */
-const ALC_PRICE_FIELD_CANDIDATES = [
-  'biz_ext.charge_price', 'biz_ext.chargeprice', 'biz_ext.charging_price',
-  'biz_ext.electricity_price', 'biz_ext.elec_price', 'biz_ext.ele_price',
-  'biz_ext.power_price', 'biz_ext.unit_price', 'biz_ext.price', 'biz_ext.fee',
-  'biz_ext.cost', 'charge_price', 'electricity_price', 'price',
-];
-const ALC_AVAILABLE_FIELD_CANDIDATES = [
-  'biz_ext.available', 'biz_ext.surplus', 'biz_ext.free', 'biz_ext.idle',
-  'biz_ext.available_num', 'biz_ext.available_count', 'biz_ext.usable',
-  'biz_ext.can_use', 'biz_ext.free_gun', 'biz_ext.idle_gun', 'biz_ext.vacant',
-  'biz_ext.surplus_num', 'biz_ext.free_num', 'biz_ext.remain', 'available', 'surplus',
-];
-const ALC_TOTAL_FIELD_CANDIDATES = [
-  'biz_ext.total', 'biz_ext.total_num', 'biz_ext.count', 'biz_ext.gun_num',
-  'biz_ext.pile_num', 'biz_ext.port_num', 'biz_ext.sum', 'total',
-];
 
 /* =============================================================================
  *  2. 通用工具
@@ -850,40 +825,6 @@ function normalizePoi(p) {
     bizExt: (p.biz_ext && typeof p.biz_ext === 'object') ? p.biz_ext : {},
     raw: p,
   };
-}
-
-/** 按点号路径取值 */
-function pickByPath(obj, path) {
-  let cur = obj;
-  for (const seg of String(path).split('.')) {
-    if (cur === null || cur === undefined || typeof cur !== 'object') return undefined;
-    cur = cur[seg];
-  }
-  return cur;
-}
-
-/** 在若干候选字段中取第一个「有值」的 */
-function pickFirstField(poi, candidates) {
-  for (const path of candidates) {
-    const v = pickByPath(poi.bizExt, path.replace(/^biz_ext\./, '')) !== undefined
-      ? pickByPath(poi.bizExt, path.replace(/^biz_ext\./, ''))
-      : pickByPath(poi.raw, path);
-    if (v === undefined || v === null) continue;
-    if (typeof v === 'string') {
-      const s = v.trim();
-      if (!s || s === '[]' || s === '-' || s === '--') continue;
-      return s;
-    }
-    if (typeof v === 'number') return v;
-    if (Array.isArray(v) && v.length) return v.join('/');
-  }
-  return undefined;
-}
-
-function parseFieldList(custom, fallback) {
-  const s = String(custom || '').trim();
-  if (!s) return fallback;
-  return s.split(',').map((x) => x.trim()).filter(Boolean);
 }
 
 class AmapWebApi {
@@ -1696,41 +1637,24 @@ const parseLngLat = (s) => {
   return [parts[0], parts[1]];
 };
 
-/** 把 POI 展平成视图需要的结构 */
+/**
+ * 把 POI 展平成视图需要的结构
+ * @param {object} poi normalizePoi 后的 POI（GCJ-02）
+ * @param {{kind:string, icon:string, origin:{lng:number,lat:number}|null}} opts
+ *        origin = 实体自身坐标（GCJ-02），**距离一律从实体起算**。
+ *        高德返回的 distance 是相对「检索中心」的，而 auto 模式的检索中心是视野中心
+ *        （用户拖走地图后与实体不是同一个点）—— 直接用它会出现
+ *        「地图上就在旁边，列表写 1.8 公里」。所以这里无视 poi.distance 重算。
+ */
 function buildPoiView(poi, opts) {
-  const { kind, icon, center, cfg } = opts;
-  const distance = poi.distance !== null
-    ? poi.distance
-    : haversine(center.lat, center.lng, poi.lat, poi.lng);
-
-  let price = null;
-  let available = null;
-  let total = null;
-  if (kind === 'charging') {
-    price = pickFirstField(poi, parseFieldList(cfg.price_fields, ALC_PRICE_FIELD_CANDIDATES));
-    available = pickFirstField(poi, parseFieldList(cfg.available_fields, ALC_AVAILABLE_FIELD_CANDIDATES));
-    total = pickFirstField(poi, parseFieldList(cfg.total_fields, ALC_TOTAL_FIELD_CANDIDATES));
-  }
-  return { kind, icon, poi, distance, price, available, total };
+  const { kind, icon, origin } = opts;
+  const oLng = origin ? toNum(origin.lng) : null;
+  const oLat = origin ? toNum(origin.lat) : null;
+  const distance = (oLng !== null && oLat !== null)
+    ? haversine(oLat, oLng, poi.lat, poi.lng)
+    : (poi.distance !== null ? poi.distance : null);
+  return { kind, icon, poi, distance };
 }
-
-const formatPrice = (v) => {
-  if (v === null || v === undefined || v === '') return null;
-  const n = toNum(v);
-  if (n !== null) return `${n} 元/度`;
-  const s = String(v).trim();
-  if (!s) return null;
-  return /元|度|kwh/i.test(s) ? s : `${s} 元/度`;
-};
-
-const formatAvailable = (v, total) => {
-  if (v === null || v === undefined || v === '') return null;
-  const n = toNum(v);
-  const t = toNum(total);
-  const core = n !== null ? `${n}` : String(v);
-  if (t !== null) return `${core} / ${t} 个可用`;
-  return n !== null ? `${core} 个可用` : core;
-};
 
 /* =============================================================================
  *  11. 卡片主体
@@ -1817,6 +1741,16 @@ class AmapLocationCard extends HTMLElement {
     if (cfg.view_mode !== 'locked') cfg.view_mode = 'follow';
     if (cfg.gesture !== 'scroll') cfg.gesture = 'map';
     if (cfg.click_action !== 'navigate') cfg.click_action = 'popup';
+
+    // POI 分类码兜底。公共厕所尤其坑：v1.0.11 及更早把默认值写成了 140306，
+    // 而高德官方分类里「公共设施;公共厕所」是 **200300**，140306 实测 count=0（永远搜不到）。
+    // 历史配置里存过旧值的，这里自动纠正，用户不用去改 dashboard。
+    const fixType = (v, fallback, legacy) => {
+      const s = String(v === undefined || v === null ? '' : v).trim();
+      return (!s || s === legacy) ? fallback : s;
+    };
+    cfg.charging_type = fixType(cfg.charging_type, '011100', '');
+    cfg.toilet_type = fixType(cfg.toilet_type, '200300', '140306');
 
     this._cfg = cfg;
     this._viewOverride = null;
@@ -3328,7 +3262,8 @@ class AmapLocationCard extends HTMLElement {
           offset: 25,                          // 取满一页，裁掉视口外的点后仍能贴住 max_poi
         });
         const items = pois
-          .map((p) => buildPoiView(p, { kind: d.kind, icon: d.icon, center, cfg }))
+          // 距离从实体起算（不是视野中心），见 buildPoiView 注释
+          .map((p) => buildPoiView(p, { kind: d.kind, icon: d.icon, origin: this._gcj }))
           .filter((it) => !clipToView || this._pinInView({ lng: it.poi.lng, lat: it.poi.lat }))
           .sort((a, b) => a.distance - b.distance)
           .slice(0, cfg.max_poi);
@@ -3660,7 +3595,6 @@ class AmapLocationCard extends HTMLElement {
   }
 
   _poiPopupHtml(item) {
-    const cfg = this._cfg;
     const poi = item.poi;
     const g = this._gcj;
     const navUrl = buildNavigationUrl({
@@ -3669,23 +3603,11 @@ class AmapLocationCard extends HTMLElement {
     });
     const markerUrl = buildMarkerUrl({ lng: poi.lng, lat: poi.lat, name: poi.name });
 
-    let rows = `<div class="alc-pop-row"><span class="k">距离</span><span class="v">${formatDistance(item.distance)}</span></div>`;
-
-    if (item.kind === 'charging') {
-      if (cfg.show_charging_price) {
-        const p = formatPrice(item.price);
-        rows += `<div class="alc-pop-row"><span class="k">电价</span><span class="v ${p ? '' : 'dim'}">${p ? escapeHtml(p) : '暂无数据'}</span></div>`;
-      }
-      if (cfg.show_charging_available) {
-        const a = formatAvailable(item.available, item.total);
-        rows += `<div class="alc-pop-row"><span class="k">可用桩</span><span class="v ${a ? '' : 'dim'}">${a ? escapeHtml(a) : '暂无数据'}</span></div>`;
-      }
-    }
+    // 充电桩面板只保留「距离 / 地址」：高德 POI 本身不提供电价与可用桩数，
+    // 旧版本靠字段映射猜出来的值长期是「暂无数据」，已于 v1.0.13 移除。
+    const rows = `<div class="alc-pop-row"><span class="k">距离</span><span class="v">${formatDistance(item.distance)}</span></div>`;
 
     const addr = poi.address ? `<div class="alc-pop-addr">${escapeHtml(poi.address)}</div>` : '';
-    const noPriceHint = (item.kind === 'charging' && cfg.show_charging_price && !formatPrice(item.price))
-      ? '<div class="alc-pop-hint">高德 POI 未提供电价字段，可在配置中用「电价字段映射」指定自定义字段。</div>'
-      : '';
 
     return `
       <div class="alc-pop">
@@ -3695,7 +3617,6 @@ class AmapLocationCard extends HTMLElement {
         </div>
         ${rows}
         ${addr}
-        ${noPriceHint}
         <div class="alc-pop-actions">
           <button type="button" class="alc-pop-btn primary" data-alc-act="open-url" data-url="${escapeHtml(navUrl)}">高德导航</button>
           <button type="button" class="alc-pop-btn" data-alc-act="open-url" data-url="${escapeHtml(markerUrl)}">地图标注</button>
@@ -3997,7 +3918,6 @@ class AmapLocationCard extends HTMLElement {
 
   _renderList() {
     if (!this._els || !this._els.listBody) return;
-    const cfg = this._cfg;
     const groups = this._poiGroups || [];
     const total = groups.reduce((s, g) => s + g.items.length, 0);
     if (this._els.listTotal) this._els.listTotal.textContent = total ? String(total) : '';
@@ -4015,14 +3935,6 @@ class AmapLocationCard extends HTMLElement {
       const rows = g.items.map((item) => {
         const meta = [];
         meta.push(`<span class="alc-meta-dist">${formatDistance(item.distance)}</span>`);
-        if (item.kind === 'charging' && cfg.show_charging_price) {
-          const p = formatPrice(item.price);
-          meta.push(`<span class="alc-meta-chip ${p ? '' : 'dim'}">电价 ${p ? escapeHtml(p) : '暂无'}</span>`);
-        }
-        if (item.kind === 'charging' && cfg.show_charging_available) {
-          const a = formatAvailable(item.available, item.total);
-          meta.push(`<span class="alc-meta-chip ${a ? '' : 'dim'}">可用 ${a ? escapeHtml(a) : '暂无'}</span>`);
-        }
         return `<div class="alc-item" data-alc-focus="${escapeHtml(item.poi.id)}" role="button" tabindex="0">
           <span class="alc-item-icon">${iconHtml(item.icon, 22)}</span>
           <span class="alc-item-main">
@@ -4104,10 +4016,8 @@ const ALC_EDITOR_SECTIONS = [
       { key: 'auto_radius_max', label: '自动范围上限（米）', type: 'number', min: 100, max: 50000, step: 100, dependsOn: { radius_mode: 'auto' }, hint: '地图缩得很远时避免检索范围撑得过大，默认 5000；缩到很小时四角可能覆盖不到' },
       { key: 'show_charging', label: '显示充电桩', type: 'boolean', hint: '周边搜索 types=011100（充电设施）' },
       { key: 'charging_type', label: '充电桩 POI 类型码', type: 'text', dependsOn: { show_charging: true }, placeholder: '011100' },
-      { key: 'show_charging_price', label: '充电桩弹窗显示电价', type: 'boolean', dependsOn: { show_charging: true } },
-      { key: 'show_charging_available', label: '充电桩弹窗显示可用桩数', type: 'boolean', dependsOn: { show_charging: true } },
-      { key: 'show_toilet', label: '显示公共厕所', type: 'boolean', hint: '周边搜索 types=140306（公共厕所）' },
-      { key: 'toilet_type', label: '公共厕所 POI 类型码', type: 'text', dependsOn: { show_toilet: true }, placeholder: '140306' },
+      { key: 'show_toilet', label: '显示公共厕所', type: 'boolean', hint: '周边搜索 types=200300（公共设施;公共厕所）' },
+      { key: 'toilet_type', label: '公共厕所 POI 类型码', type: 'text', dependsOn: { show_toilet: true }, placeholder: '200300' },
       { key: 'max_poi', label: '每类最多显示（1-25）', type: 'number', min: 1, max: 25 },
       { key: 'show_radius_circle', label: '显示搜索半径圈', type: 'boolean', hint: '默认关闭。检索范围本来就是整张地图的可视区域，不需要额外画圈。' },
     ],
@@ -4145,9 +4055,6 @@ const ALC_EDITOR_SECTIONS = [
       { key: 'gesture', label: '地图手势策略', type: 'select', options: [['map', '地图优先（推荐，防止 iOS 手势异常）'], ['scroll', '页面滚动优先']], hint: 'iOS Safari 上建议「地图优先」' },
       { key: 'force_webgl', label: '强制启用 WebGL（iOS App 出底图的关键）', type: 'boolean', hint: '高德 JSAPI 取 WebGL 上下文时带了 failIfMajorPerformanceCaveat，图形性能弱的环境（iOS App 的 WKWebView 最典型）会直接拿不到上下文 → 底图一片空白。默认开：在加载 JSAPI 脚本前置 window.forceWebGL = true。只有确认它导致画面异常时才关。' },
       { key: 'show_debug', label: '在状态栏显示调试统计', type: 'boolean' },
-      { key: 'price_fields', label: '电价字段映射', type: 'text', hint: '逗号分隔的字段路径，按顺序探测 biz_ext。留空使用内置候选。' },
-      { key: 'available_fields', label: '可用桩数字段映射', type: 'text' },
-      { key: 'total_fields', label: '总桩数字段映射', type: 'text' },
     ],
   },
 ];
@@ -4592,8 +4499,6 @@ ha-card { overflow:hidden; }
 .alc-item-name { font-size:13px; color:var(--primary-text-color); line-height:1.3; }
 .alc-item-meta { display:flex; flex-wrap:wrap; gap:6px; align-items:center; font-size:11px;
   color:var(--secondary-text-color); }
-.alc-meta-chip { background:var(--secondary-background-color, rgba(0,0,0,.05)); border-radius:6px; padding:1px 6px; }
-.alc-meta-chip.dim, .dim { opacity:.55; }
 .alc-item-addr { font-size:11px; color:var(--secondary-text-color); opacity:.85;
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .alc-item-actions { flex:0 0 auto; display:flex; gap:6px; }
@@ -4613,7 +4518,6 @@ ha-card { overflow:hidden; }
 .alc-pop-row .v { text-align:right; font-weight:500; }
 .alc-pop-row .v.mono { font-variant-numeric:tabular-nums; font-size:11px; }
 .alc-pop-addr { margin-top:5px; color:var(--secondary-text-color); font-size:11px; line-height:1.35; }
-.alc-pop-hint { margin-top:5px; font-size:10.5px; color:var(--secondary-text-color); opacity:.8; line-height:1.35; }
 .alc-pop-actions { display:flex; gap:6px; margin-top:9px; flex-wrap:wrap; }
 .alc-pop-btn { flex:1 1 auto; border:1px solid var(--divider-color, rgba(0,0,0,.14)); background:transparent;
   color:var(--primary-text-color); border-radius:8px; padding:6px 8px; font-size:12px; cursor:pointer;
