@@ -1756,9 +1756,15 @@ class AmapLocationCard extends HTMLElement {
   /**
    * 底图空白自愈：先补一次 resize，再重新应用视野。
    * iOS App 的 WKWebView 在从后台恢复后常见「画布在、瓦片没了」，这一步能救回大部分情况。
+   * 容器还没有尺寸时不做任何事 —— 那种情况由 _resizeMap 的「0 → 有尺寸」分支处理，
+   * 否则会在卡片还没排版好时把用户的缩放级别重置掉。
    */
   _recoverBlankMap() {
     if (!this._map || this._mapMode !== 'amap') return;
+    const wrap = this._els && this._els.mapWrap;
+    const w = wrap ? wrap.clientWidth : 0;
+    const h = wrap ? wrap.clientHeight : 0;
+    if (w === 0 || h === 0) return;
     try { this._map.resize(); } catch (e) { /* ignore */ }
     this._viewInitialized = false;
     this._applyView(true);
