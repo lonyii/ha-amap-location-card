@@ -16,7 +16,7 @@
  *   · iPhone Safari：touch-action 手势治理、固定 px 高度、WebGL 探测、点击兜底
  * ============================================================================= */
 
-const ALC_VERSION = '1.0.1';
+const ALC_VERSION = '1.0.2';
 const ALC_CARD_TAG = 'amap-location-card';
 const ALC_EDITOR_TAG = 'amap-location-card-editor';
 
@@ -474,11 +474,58 @@ const amapLoader = {
     });
   },
 
+  /**
+   * WebGL 可用性探测。
+   *
+   * 只用来「诊断 / 提示」，**不再作为是否加载底图的开关**（见 _ensureMap）。
+   * 原因：HA iOS App 跑的是 WKWebView，未挂载到文档的 canvas 在部分 iOS 版本上
+   * 拿不到 WebGL 上下文（Safari 里同样的写法却是好的）—— 旧逻辑据此直接降级成
+   * 简化视图，表现就是「iOS App 里没有底图、Safari 正常」。
+   *
+   * 探测本身也做了加固：临时挂载 + 显式 1×1（WKWebView 对 0 尺寸 / 离屏 canvas 更挑）、
+   * 依次尝试 webgl2 / webgl / experimental-webgl、并且**用完就释放上下文** ——
+   * iOS 上 WebGL 上下文配额很少（约 8 个），探测泄漏一个都可能让后面的地图建不出来。
+   */
   hasWebGL() {
+    let c = null;
+    let attached = false;
+    let ctx = null;
+    try {
+      c = document.createElement('canvas');
+      c.width = 1; c.height = 1;
+      c.style.cssText = 'position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none';
+      const host = document.body || document.documentElement;
+      if (host) { host.appendChild(c); attached = true; }
+      const opts = { failIfMajorPerformanceCaveat: false, antialias: false, depth: false, stencil: false };
+      for (const name of ['webgl2', 'webgl', 'experimental-webgl']) {
+        try { ctx = c.getContext(name, opts); } catch (e) { ctx = null; }
+        if (ctx) break;
+      }
+      return !!ctx;
+    } catch (e) {
+      return false;
+    } finally {
+      try {
+        const lose = ctx && ctx.getExtension && ctx.getExtension('WEBGL_lose_context');
+        if (lose) lose.loseContext();
+      } catch (e) { /* ignore */ }
+      if (attached && c && c.parentNode) { try { c.parentNode.removeChild(c); } catch (e) { /* ignore */ } }
+    }
+  },
+
+  /** 诊断用：WebGL 的渲染器名称（iOS App 里可据此判断是软件渲染还是被禁用） */
+  webglInfo() {
     try {
       const c = document.createElement('canvas');
-      return !!(c.getContext('webgl') || c.getContext('experimental-webgl'));
-    } catch (e) { return false; }
+      c.width = 1; c.height = 1;
+      const ctx = c.getContext('webgl') || c.getContext('experimental-webgl');
+      if (!ctx) return 'unavailable';
+      const dbg = ctx.getExtension && ctx.getExtension('WEBGL_debug_renderer_info');
+      const renderer = dbg ? ctx.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : ctx.getParameter(ctx.RENDERER);
+      const lose = ctx.getExtension && ctx.getExtension('WEBGL_lose_context');
+      if (lose) lose.loseContext();
+      return String(renderer || 'unknown');
+    } catch (e) { return 'error: ' + ((e && e.message) || e); }
   },
 
   /**
@@ -1649,6 +1696,32 @@ class AmapLocationCard extends HTMLElement {
       try { window.addEventListener('online', this._onOnline); } catch (e) { /* ignore */ }
     }
 
+    // WebGL 上下文丢失：iOS App 从后台回来 / 内存紧张时最常见，画布还在但底图变白。
+    // 事件不冒泡，但捕获阶段能在容器上收到。
+    this._els.mapEl.addEventListener('webglcontextlost', () => {
+      if (this._mapMode !== 'amap') return;
+      this._log('WebGL 上下文丢失');
+      this._showNotice('webgl-lost', 'warn',
+        '地图渲染上下文丢失（iOS 从后台回来或内存紧张时常见），底图可能变空白。点「重试」重建地图即可恢复。',
+        '重试', () => this._retryMap(),
+        { label: '复制诊断', action: () => this._copyDiagnostics() });
+    }, true);
+
+    // App 切回前台：WKWebView 经常不重绘，这里补一次 resize；有失败提示时顺手重试一次
+    if (!this._onVisible) {
+      this._onVisible = () => {
+        if (document.visibilityState !== 'visible' || !this._cfg) return;
+        if (this._mapMode !== 'amap') return;
+        this._resizeMap();
+        const broken = ['webgl-lost', 'map-timeout', 'maperr'].some((id) => this._notices.has(id));
+        if (broken) {
+          this._log('回到前台且底图异常 → 重建地图');
+          this._retryMap();
+        }
+      };
+      try { document.addEventListener('visibilitychange', this._onVisible); } catch (e) { /* ignore */ }
+    }
+
     this._renderNotices();
     this._renderStatus();
   }
@@ -1658,9 +1731,37 @@ class AmapLocationCard extends HTMLElement {
   /* ------------------------------------------------------ 地图容器 */
 
   _resizeMap() {
+    const wrap = this._els && this._els.mapWrap;
+    const w = wrap ? wrap.clientWidth : 0;
+    const h = wrap ? wrap.clientHeight : 0;
+    const prev = this._wrapSize || { w: 0, h: 0 };
+    this._wrapSize = { w, h };
+
     if (this._map) { try { this._map.resize(); } catch (e) { /* ignore */ } }
     if (this._fbMap) { try { this._fbMap.resize(); } catch (e) { /* ignore */ } }
+
+    // 容器从「0 尺寸 / 不可见」变为有尺寸：HA App 恢复上次视图、从后台回来、
+    // 卡片在隐藏 Tab 里创建，都走这条。高德在 0×0 容器上建图不会请求瓦片，
+    // 单靠 map.resize() 补不回来，必须重新应用一次视野。
+    const grew = (prev.w === 0 || prev.h === 0) && w > 0 && h > 0;
+    if (grew && this._map && this._mapMode === 'amap') {
+      this._log(`容器尺寸恢复（${prev.w}×${prev.h} → ${w}×${h}）→ 重新应用视野`);
+      this._applyView(true);
+      this._notices.delete('map-timeout');
+      this._renderNotices();
+    }
     if (this._mapMode) this._onViewportChanged();
+  }
+
+  /**
+   * 底图空白自愈：先补一次 resize，再重新应用视野。
+   * iOS App 的 WKWebView 在从后台恢复后常见「画布在、瓦片没了」，这一步能救回大部分情况。
+   */
+  _recoverBlankMap() {
+    if (!this._map || this._mapMode !== 'amap') return;
+    try { this._map.resize(); } catch (e) { /* ignore */ }
+    this._viewInitialized = false;
+    this._applyView(true);
   }
 
   /* ------------------------------------------------------ 搜索半径 */
@@ -1950,17 +2051,13 @@ class AmapLocationCard extends HTMLElement {
     const cfg = this._cfg;
     const mock = alcMock();
     const jsKey = String(cfg.amap_js_key || '').trim() || String(cfg.amap_key || '').trim();
-    const webgl = alcMock() ? !(mock && mock.noJsApi) : amapLoader.hasWebGL();
     const canJs = !!jsKey && !(mock && mock.noJsApi);
-
-    if (canJs && !webgl) {
-      this._showNotice('webgl', 'warn',
-        '当前浏览器不支持 WebGL（iOS Safari 上较常见），已切换为简化视图，点位与列表功能不受影响。',
-        '重试', () => this._retryMap());
-      this._createFallbackMap();
-      this._mapMode = 'fallback';
-      return this._mapMode;
-    }
+    // WebGL 探测结果只做诊断记录，**不再决定要不要加载底图**：
+    // HA iOS App 的 WKWebView 可能误报 false（见 amapLoader.hasWebGL 注释），
+    // 一旦据此提前降级，用户看到的就是「iOS App 没有底图，Safari 正常」。
+    // 现在一律先真的去加载，真不支持时高德会自己报错，我们再降级并给可操作提示。
+    this._webglProbe = alcMock() ? !(mock && mock.noJsApi) : amapLoader.hasWebGL();
+    this._log(`底图准备：key=${jsKey ? '有' : '无'} webgl=${this._webglProbe} ua=${navigator.userAgent}`);
 
     if (canJs) {
       try {
@@ -1980,8 +2077,10 @@ class AmapLocationCard extends HTMLElement {
         this._hideLoading();
         // 失败原因做一次域名探测，把「网络不通」和「脚本被拦」区分开，提示才可操作
         const why = await diagnoseJsApiFailure(e);
+        const glHint = this._webglProbe ? '' : '（另：本设备 WebGL 探测未通过，若为 iOS 应用内可能误报，点「重试」可再试一次）';
         this._showNotice('jsapi', 'warn',
-          `${e.message}，已切换为简化视图，点位与列表功能不受影响。${why}`, '重试', () => this._retryMap());
+          `${e.message}，已切换为简化视图，点位与列表功能不受影响。${why}${glHint}`, '重试', () => this._retryMap(),
+          { label: '复制诊断', action: () => this._copyDiagnostics() });
       }
     } else if (!jsKey) {
       this._showNotice('nokey', 'warn',
@@ -2034,8 +2133,11 @@ class AmapLocationCard extends HTMLElement {
         hint = '（安全密钥缺失或不正确：请在「高级：多 Key 与安全密钥」里填入控制台的 securityJsCode）';
       } else if (/USER_KEY|INVALID_USER/i.test(msg)) {
         hint = '（该 Key 可能不是「Web 端(JS API)」类型，可在高德控制台确认）';
+      } else if (/webgl/i.test(msg) || /WebGL/i.test(msg)) {
+        hint = '（该 WebView 未启用 WebGL。iOS 上多见于 App 内嵌浏览器，可换 Safari 打开，或在 iOS 设置里关闭「低电量模式」后重试）';
       }
-      this._showNotice('mapfail', 'error', `地图初始化失败：${msg}${hint}`, '重试', () => this._retryMap());
+      this._showNotice('mapfail', 'error', `地图初始化失败：${msg}${hint}`, '重试', () => this._retryMap(),
+        { label: '复制诊断', action: () => this._copyDiagnostics() });
       this._createFallbackMap();
       this._mapMode = 'fallback';
       return false;
@@ -2058,7 +2160,8 @@ class AmapLocationCard extends HTMLElement {
       } else if (/USER_KEY|INVALID_USER/i.test(msg)) {
         keyHint = '（该 Key 可能不是「Web 端(JS API)」类型，可在高德控制台确认；周边检索与坐标转换不受影响）';
       }
-      this._showNotice('maperr', 'warn', `地图渲染异常：${msg}${keyHint}，可点击「重试」重建地图。`, '重试', () => this._retryMap());
+      this._showNotice('maperr', 'warn', `地图渲染异常：${msg}${keyHint}，可点击「重试」重建地图。`, '重试', () => this._retryMap(),
+        { label: '复制诊断', action: () => this._copyDiagnostics() });
     });
     // 「自动跟随 / 回到定位」这类程序化改视野同样会触发 zoomstart/zoomend。
     // 若无条件记成用户操作，自动跟随会被自己关掉 15 秒 —— 必须放过这段窗口。
@@ -2075,9 +2178,13 @@ class AmapLocationCard extends HTMLElement {
     clearTimeout(this._mapTimeout);
     this._mapTimeout = setTimeout(() => {
       if (!this._mapReady) {
+        // App 内嵌 WebView（iOS）里偶发：卡片初始尺寸为 0 或 WebGL 上下文被回收，
+        // 高德不会发瓦片请求。这里除了提示，还补一次 resize，很多时候一补就恢复。
+        this._recoverBlankMap();
         this._showNotice('map-timeout', 'warn',
-          '地图底图渲染超时（可能是 WebGL 或网络问题），可打开「列表」查看点位，或点击「重试」。',
-          '重试', () => this._retryMap());
+          '地图底图渲染超时（App 内嵌浏览器里较常见，多为初始尺寸为 0 或 WebGL 上下文被回收），可点「重试」重建；点位列表不受影响。',
+          '重试', () => this._retryMap(),
+          { label: '复制诊断', action: () => this._copyDiagnostics() });
         this._showList(true);
       }
     }, 12000);
@@ -2409,10 +2516,16 @@ class AmapLocationCard extends HTMLElement {
   _teardownAll() {
     this._teardownMap();
     clearTimeout(this._trailing);
+    clearTimeout(this._mapTimeout);
+    clearTimeout(this._listResizeTimer);
     if (this._onClick && this._shadow) { this._shadow.removeEventListener('click', this._onClick); this._onClick = null; }
     if (this._onOnline) {
       try { window.removeEventListener('online', this._onOnline); } catch (e) { /* ignore */ }
       this._onOnline = null;
+    }
+    if (this._onVisible) {
+      try { document.removeEventListener('visibilitychange', this._onVisible); } catch (e) { /* ignore */ }
+      this._onVisible = null;
     }
   }
 
@@ -2903,10 +3016,89 @@ class AmapLocationCard extends HTMLElement {
     try { console.debug('[amap-location-card]', ...args); } catch (e) { /* ignore */ }
   }
 
-  _showNotice(id, level, text, actionLabel, action) {
+  /** 是否跑在 iOS/安卓 App 的 WKWebView 里（诊断用，不参与任何渲染决策） */
+  _isInAppWebView() {
+    try {
+      const ua = navigator.userAgent || '';
+      if (/Home Assistant/i.test(ua)) return true;
+      const w = window.webkit;
+      return !!(w && w.messageHandlers && w.messageHandlers.externalBus);   // HA Companion App 的桥
+    } catch (e) { return false; }
+  }
+
+  /**
+   * 一键诊断文本。iOS App 里没有开发者工具，底图不显示时靠这段文本判断原因：
+   * 是否 WKWebView、WebGL 有没有、容器尺寸是不是 0、脚本/Key 走哪条路、错误码是什么。
+   */
+  _diagText() {
+    const cfg = this._cfg || {};
+    const jsKey = String(cfg.amap_js_key || '').trim() || String(cfg.amap_key || '').trim();
+    const wrap = this._els && this._els.mapWrap;
+    const r = wrap && wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
+    const canvas = this._mapEl ? this._mapEl.querySelectorAll('canvas') : [];
+    const notices = Array.from((this._notices || new Map()).entries())
+      .map(([id, n]) => `  · ${id}: ${n.text}`).join('\n') || '  · (无)';
+    return [
+      `amap-location-card v${ALC_VERSION}`,
+      `时间：${new Date().toISOString()}`,
+      `UA：${navigator.userAgent}`,
+      `环境：${this._isInAppWebView() ? 'HA App / 内嵌 WebView' : '浏览器'}`,
+      `屏幕：${window.innerWidth}×${window.innerHeight} @${window.devicePixelRatio || 1}x`,
+      `卡片容器：${r ? `${Math.round(r.width)}×${Math.round(r.height)}` : '未知'}`,
+      `地图模式：${this._mapMode || '未创建'} · 地图就绪：${this._mapReady ? '是' : '否'} · canvas 数：${canvas.length}`,
+      `WebGL 探测：${this._webglProbe === undefined ? '未执行' : (this._webglProbe ? '通过' : '未通过')}`,
+      `WebGL 渲染器：${amapLoader.webglInfo()}`,
+      `Key：${jsKey ? `${jsKey.slice(0, 6)}…（${jsKey.length} 位，来源 ${String(cfg.amap_js_key || '').trim() ? 'amap_js_key' : 'amap_key'}）` : '未配置'}`,
+      `安全密钥：${String(cfg.security_js_code || '').trim() ? '已配置' : '未配置'}`,
+      `JS API：v${AMAP_JS_VERSION} · ${AMAP_JS_API_BASE}`,
+      `视野：${this._rgcjForDiag()}`,
+      `提示条：\n${notices}`,
+    ].join('\n');
+  }
+
+  _rgcjForDiag() {
+    try {
+      if (this._map && this._map.getCenter) {
+        const c = this._map.getCenter();
+        return `center ${Number(c.getLng()).toFixed(5)},${Number(c.getLat()).toFixed(5)} zoom ${this._map.getZoom()}`;
+      }
+      if (this._fbMap) return `fallback zoom ${this._fbMap.zoom}`;
+    } catch (e) { /* ignore */ }
+    return '未知';
+  }
+
+  /** 把诊断信息复制到剪贴板（iOS WKWebView 里 navigator.clipboard 可能被拒 → 退回 execCommand） */
+  async _copyDiagnostics() {
+    const text = this._diagText();
+    try { console.warn('[amap-location-card] 诊断信息\n' + text); } catch (e) { /* ignore */ }
+    const done = () => this._showNotice('diag', 'info', '诊断信息已复制，可直接粘贴给开发者排查。');
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        done();
+        return;
+      }
+    } catch (e) { /* 落到下面的兜底 */ }
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0';
+      (document.body || document.documentElement).appendChild(ta);
+      ta.select();
+      ta.setSelectionRange(0, text.length);
+      const ok = document.execCommand && document.execCommand('copy');
+      if (ta.parentNode) ta.parentNode.removeChild(ta);
+      if (ok) { done(); return; }
+    } catch (e) { /* ignore */ }
+    // 都失败：至少把内容打到控制台，并提示长度
+    this._showNotice('diag', 'warn', `无法写入剪贴板，诊断信息已输出到浏览器控制台（${text.length} 字符）。`);
+  }
+
+  _showNotice(id, level, text, actionLabel, action, extra) {
     const existing = this._notices.get(id);
     if (existing && existing.text === text && existing.level === level) return;
-    this._notices.set(id, { level, text, actionLabel, action });
+    this._notices.set(id, { level, text, actionLabel, action, extra });
     this._renderNotices();
   }
 
@@ -2918,6 +3110,7 @@ class AmapLocationCard extends HTMLElement {
       <div class="alc-notice alc-notice-${n.level}" data-notice="${escapeHtml(id)}">
         <span class="alc-notice-text">${escapeHtml(n.text)}</span>
         ${n.actionLabel ? `<button type="button" class="alc-notice-btn" data-notice-act="${escapeHtml(id)}">${escapeHtml(n.actionLabel)}</button>` : ''}
+        ${n.extra && n.extra.label ? `<button type="button" class="alc-notice-btn ghost" data-notice-extra="${escapeHtml(id)}">${escapeHtml(n.extra.label)}</button>` : ''}
         <button type="button" class="alc-notice-x" data-notice-close="${escapeHtml(id)}" aria-label="关闭">×</button>
       </div>`).join('');
 
@@ -2933,6 +3126,13 @@ class AmapLocationCard extends HTMLElement {
         ev.stopPropagation();
         const n = this._notices.get(b.dataset.noticeAct);
         if (n && typeof n.action === 'function') n.action();
+      });
+    });
+    this._els.notices.querySelectorAll('[data-notice-extra]').forEach((b) => {
+      b.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        const n = this._notices.get(b.dataset.noticeExtra);
+        if (n && n.extra && typeof n.extra.action === 'function') n.extra.action();
       });
     });
   }
@@ -3516,6 +3716,8 @@ ha-card { overflow:hidden; }
 .alc-notice-text { flex:1 1 auto; }
 .alc-notice-btn { flex:0 0 auto; border:none; border-radius:8px; padding:3px 10px; cursor:pointer;
   background:var(--primary-color,#03a9f4); color:#fff; font-size:12px; }
+.alc-notice-btn.ghost { background:transparent; color:var(--primary-text-color);
+  border:1px solid var(--divider-color, rgba(0,0,0,.22)); }
 .alc-notice-x { flex:0 0 auto; border:none; background:transparent; cursor:pointer;
   color:var(--secondary-text-color); font-size:16px; line-height:1; padding:0 2px; }
 
