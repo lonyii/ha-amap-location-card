@@ -16,7 +16,7 @@
  *   · iPhone Safari：touch-action 手势治理、固定 px 高度、WebGL 探测、点击兜底
  * ============================================================================= */
 
-const ALC_VERSION = '1.0.7';
+const ALC_VERSION = '1.0.8';
 const ALC_CARD_TAG = 'amap-location-card';
 const ALC_EDITOR_TAG = 'amap-location-card-editor';
 
@@ -1114,32 +1114,23 @@ function buildNavigationUrl({ fromLng, fromLat, fromName, toLng, toLat, toName, 
  * @param {string} url
  * @param {boolean} newTab true（默认）= 新标签页/新窗口打开，**原页面绝不跳转**；
  *        false = 当前页面直接跳转（部分 iOS 环境唤起高德 App 更可靠，故保留为可配置项）
- * @returns {boolean} 是否已交给新标签页（false = 浏览器拦得死死的，什么都没做）
+ * @returns {boolean} 是否已交给新标签页
  *
- * 注意：**不能**用 `window.open(url, '_blank', 'noopener')` 的返回值判断是否被拦截 ——
- * 按 HTML 规范，带 `noopener` 时 window.open 一律返回 null。旧实现据此误判成「被拦截」
- * 然后 `location.href = url` 跳转，结果就是点一下 POI 标签整张 HA 面板被高德页面顶掉。
- * 现在：先 window.open（不带 noopener，事后把 opener 置空）→ 被拦则用临时
- * `<a target="_blank" rel="noopener noreferrer">` 再试一次 → 都不行就什么也不做（绝不顶掉原页面）。
+ * 这里踩过两个坑，改之前务必看完：
+ *  ① **不能**用 `window.open(url, '_blank', 'noopener')` 的返回值判断是否被拦截 —— 按 HTML 规范，
+ *     带 `noopener` 时 window.open 一律**返回 null**（新标签页其实已经开出来了），旧实现据此
+ *     判成「被拦截」再 `location.href = url`，于是「新标签开一次 + 原页面又跳一次」的双跳。
+ *  ② **不能** window.open 失败后再补一次锚点点击 —— window.open 会**消耗本次用户激活**，
+ *     紧随其后的 `a.click()` 会被当成无手势弹窗直接丢弃（CDP 实测：新标签开不出来）。
+ * 所以新标签分支**只做一件事**：用临时 `<a target="_blank" rel="noopener noreferrer">` 打开。
+ * 浏览器原生 target 语义，不碰当前文档，也不依赖 window.open 的返回值。
  */
 function openExternal(url, newTab) {
   if (!url) return false;
   if (newTab === false) {
     try { window.location.href = url; return false; } catch (e) { /* ignore */ }
   }
-  // ① window.open：不带 noopener（否则返回值恒为 null，见上）
-  let win = null;
-  try { win = window.open(url, '_blank'); } catch (e) { win = null; }
-  if (win) {
-    try { win.opener = null; } catch (e) { /* 跨域窗口可能不允许写，忽略 */ }
-    return true;
-  }
-  // ①b 返回 null 但页面已经被盖住（新的 WebView / 前台视图已经起来了）→ 认为已经开过，
-  //     绝不能再走兜底，否则就是「新标签页开一次 + 原页面又跳一次」的双跳。
-  try {
-    if (document.visibilityState === 'hidden' || document.hasFocus() === false) return true;
-  } catch (e) { /* ignore */ }
-  // ② 被弹窗拦截（App 内嵌 WebView 常见）→ 用临时 <a target="_blank"> 触发，等价于用户按住新标签打开
+  // 唯一入口：临时锚点（原生 target=_blank，原页面不会被替换）
   try {
     const host = document.body || document.documentElement;
     if (host && document.createElement) {
@@ -1148,14 +1139,19 @@ function openExternal(url, newTab) {
       a.target = '_blank';
       a.rel = 'noopener noreferrer';
       a.referrerPolicy = 'no-referrer';
-      a.style.display = 'none';
+      // 不用 display:none —— 部分 iOS Safari 会忽略不可见元素上的程序化点击
+      a.style.cssText = 'position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none;';
       host.appendChild(a);
       a.click();
       if (a.parentNode) a.parentNode.removeChild(a);
       return true;
     }
-  } catch (e) { /* 落到 ③ */ }
-  // ③ 都不行：保持原页面不动（宁可没打开，也不能把用户的 HA 面板换成高德页面）
+  } catch (e) { /* 落到兜底 */ }
+  // 没有 DOM 可挂（几乎不会发生）：退回 window.open，仍然绝不写 location.href
+  try {
+    const win = window.open(url, '_blank');
+    if (win) { try { win.opener = null; } catch (e) { /* ignore */ } return true; }
+  } catch (e) { /* ignore */ }
   return false;
 }
 

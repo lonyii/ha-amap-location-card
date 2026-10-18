@@ -257,7 +257,7 @@ map_height: "100%"                     # 跟随父容器高度（panel 视图 / 
 | `icon_toilet` | string | `mdi:human-male-female` | 公厕图标 |
 | `icon_size` | number | `34` | 图标尺寸（px）16–96 |
 | `click_action` | `popup` / `navigate` | `popup` | 点击标记：弹信息窗 / 直接唤起导航 |
-| `open_in_new_tab` | boolean | `true` | `true` = 新标签打开，保留 HA 面板；`false` = 当前页跳转（若 `window.open` 被 WebView 拦截会自动回退到当前页跳转） |
+| `open_in_new_tab` | boolean | `true` | `true` = 点「高德导航 / 地图标注」在**新标签页**打开，原页面（HA 面板）保持不动；`false` = 当前页直接跳转（回来要重新进面板）。新标签分支只用临时 `<a target="_blank" rel="noopener noreferrer">`（原生 target 语义，不碰当前文档），**任何情况下都不会再把原页面顶掉** |
 | `coord_cache_ttl` | number | `300` | 坐标转换缓存秒数，`0` = 关闭缓存 |
 | `poi_cache_ttl` | number | `300` | 周边检索缓存秒数，`0` = 关闭缓存 |
 | `api_min_interval` | number | `400` | 两次高德请求最小间隔（ms），节流防抖 |
@@ -516,7 +516,7 @@ HA 官方 iOS App 用的是 **WKWebView**，它和 Safari 同一个内核但不�
 点一下会把下面这些信息写进剪贴板（App 里也能用），直接粘贴反馈即可定位：
 
 ```
-amap-location-card v1.0.7
+amap-location-card v1.0.8
 UA：（完整 UA，可判断是否 App 内嵌 WebView）
 环境：HA App / 内嵌 WebView | 浏览器
 屏幕：390×844 @3x
@@ -606,6 +606,7 @@ JS API：v2.0 · https://webapi.amap.com/maps
 | **地图拖不动 / 滚轮不缩放** | 本卡片用手势层接管了高德底图的全部交互（JSAPI 2.0 在 Shadow DOM 下的已知缺陷，见「已知问题」一节）。请更新到最新版本；若仍复现，确认浏览器未禁用 Pointer Events（iOS 13+/现代浏览器均支持） |
 | **缩放（双指捏合/滚轮）后定位点整体错位、和地图对不上** | 已修复：手势路径的 `setZoom` / `setCenter` 现在全部立即生效（带动画的调用在 iOS 上被逐帧打断后，标记层会与瓦片层脱节），且捏合改为**锚定双指中点**缩放（指下的地点不再滑走）。请更新到最新版本 |
 | **弹窗开着缩放地图后，弹窗内容和图上的点对不上** | 已修复：重检索重建标记后，弹窗自动换绑到同 id 的新数据；该 POI 被新半径挤出结果时弹窗自动收起 |
+| **点 POI 里的「高德导航 / 地图标注」时，既开了新标签页、原页面又被顶掉一次（双跳）** | v1.0.8 已修。旧实现用 `window.open(url,'_blank','noopener')` 的返回值判断是否被拦截，但按 HTML 规范**带 `noopener` 时该调用一律返回 `null`**（新标签页其实已经开出来了），于是又走了 `location.href` 兜底 → 双跳。现在新标签分支只用临时 `<a target="_blank" rel="noopener noreferrer">`（原生 target 语义，用完即移除），**完全不写 `location.href`**，也不再依赖 `window.open` 的返回值。更新到 v1.0.8 即可 |
 | **打开配置面板后每隔两三秒整页闪一下 / 输入框失焦、刚填的值被清掉** | 已修复（v1.0.1）：编辑器等 `ha-textfield` / `ha-entity-picker` 注册后升级原生控件，旧逻辑只要其中一个存在就重建表单，在 HA 里（`ha-entity-picker` 按需加载、常常一直不注册）会变成每 2.5 秒无限重建。现在按「已渲染的能力档位」升级，同一档只升一次，且正在输入时推迟到失焦 |
 | **定位十字和实体标记对不上 / 拖动地图后准星还在原地** | 已修复：简化视图的十字准星与半径圈改为画在实体投影位置上，跟着实体走 |
 | 标记溢出到地图外面，盖住了页面 | 已修复：地图容器加了 `overflow: hidden`，标记与弹窗一律裁剪在地图框内 |
