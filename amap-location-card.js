@@ -8,8 +8,11 @@
  *   · 所有高德请求统一走「节流 + 去重 + TTL 缓存」，避免超限
  *   · 全链路降级：Web 服务失败 → JS API 插件 → 原始坐标（并给出提示，绝不炸卡）
  *   · 地图渲染失败 / 无 WebGL（iOS Safari 常见）→ 自动切换简化视图，功能不丢
- *   · 「自动搜索范围」默认取内切半径（中心→最近边），保证每条结果都落在可见范围内；
- *     另有 _checkPinsVisible / _fitAllPins 兜住「结果跑出画面」的情况
+ *   · 「自动搜索范围」= 浏览者屏幕上的可视矩形（随容器尺寸 / 缩放自适应）。
+ *     高德周边检索只支持圆形：先按「中心→最远角」的外接半径去搜，再把落在矩形外的
+ *     结果裁掉 —— 合起来等价于一次矩形范围检索，屏幕里一条不漏、屏幕外一条不显示
+ *   · 搜索范围圈默认不画（show_radius_circle=false）：范围就是整张地图，画圈只是噪音
+ *   · fixed 模式（用户显式指定半径）不做裁剪，仍有 _checkPinsVisible / _fitAllPins 兜底
  *   · iPhone Safari：touch-action 手势治理、固定 px 高度、WebGL 探测、点击兜底
  * ============================================================================= */
 
@@ -60,7 +63,8 @@ const ALC_DEFAULTS = {
   map_style: 'amap://styles/normal',
   gesture: 'map',                 // map（地图吃掉手势）| scroll（纵向滚动优先）
   show_source_marker: true,
-  show_radius_circle: true,
+  // 搜索范围圈默认不画：检索范围就是整张地图的可视区域，画圈只是多一层视觉噪音
+  show_radius_circle: false,
   show_scale: true,
   show_toolbar: true,
 
@@ -68,11 +72,12 @@ const ALC_DEFAULTS = {
   radius_mode: 'auto',            // auto（跟随地图当前缩放 / 可视范围）| fixed（固定半径）
   radius: 2000,                   // fixed 模式下的固定半径（米）
   // 自动半径的取法：
-  //   visible（默认）= 中心→最近边（内切圆）。检索圈整个落在可视矩形内，
-  //                    因此每一条结果都必然看得见 —— 不会再出现「点标到底图外面」。
-  //   cover          = 中心→最远角（外接圆）。保证检索覆盖整个视口，
-  //                    但圆内不等于图内，四角方向的结果会跑到可视范围之外。
-  auto_radius_basis: 'visible',
+  //   cover（默认）= 中心→最远角（外接圆）。检索覆盖整个可视矩形 —— 视口里能看到的
+  //                  每一个 POI 都在检索范围内，不会出现「地图上明明有、列表里没有」。
+  //   visible      = 中心→最近边（内切圆）。只搜画面中间的一块，四角方向不覆盖。
+  // 两种取法下，auto 模式都会把落在视口外的结果剔除（见 _fetchPois），
+  // 所以地图上只会出现看得见的点，不需要「铺满显示」兜底。
+  auto_radius_basis: 'cover',
   auto_radius_pad: 1,             // 自动半径系数：1 = 恰好贴到可视边缘
   auto_radius_max: 5000,          // 自动半径上限（米），避免缩得很远时把检索范围撑爆
   show_charging: true,
@@ -969,6 +974,9 @@ class CanvasFallbackMap {
     this.onMarkerClick = opts.onMarkerClick || (() => {});
     this.onViewChange = opts.onViewChange || (() => {});
     this.onZoom = opts.onZoom || (() => {});
+    // 卡片已经在地图右下角放了统一控件列（回到定位 / + / − / 列表），
+    // 默认不再重复创建简化视图自带的一套按钮。
+    this.showControls = opts.controls !== false;
     this._pointers = new Map();
     this._pinchDist = 0;
     this._dragging = false;
@@ -988,6 +996,8 @@ class CanvasFallbackMap {
     layer.className = 'alc-fm-layer';
     this.layer = layer;
 
+    // 卡片本身在地图上有一列控件（回到定位 / + / − / 列表），这里默认不再自建一套，
+    // 否则右下角会出现两组互相重叠的按钮。单独使用 CanvasFallbackMap 时才需要它。
     const controls = document.createElement('div');
     controls.className = 'alc-fm-controls';
     controls.innerHTML = `
@@ -1016,7 +1026,7 @@ class CanvasFallbackMap {
     this.host.appendChild(canvas);
     this.host.appendChild(layer);
     this.host.appendChild(badge);
-    this.host.appendChild(controls);
+    if (this.showControls) this.host.appendChild(controls);
     this.host.appendChild(popup);
 
     this._bindGestures();
@@ -1130,8 +1140,8 @@ class CanvasFallbackMap {
 
   /**
    * 当前可视范围对应的半径（米）。
-   *   basis='visible'（默认）：中心 → 最近边（内切圆），圈内每一点都在画布内
-   *   basis='cover'          ：中心 → 四角（外接圆），覆盖整个画布但不保证点在图内
+   *   basis='cover'（默认）：中心 → 四角（外接圆），覆盖整个可视矩形
+   *   basis='visible'      ：中心 → 最近边（内切圆），只覆盖画面中间一块
    * 地图缩小时可视面积变大，返回值随之变大 —— 这就是「自动搜索范围」的依据。
    */
   viewportRadius(basis) {
@@ -1509,7 +1519,7 @@ class AmapLocationCard extends HTMLElement {
     this._notices.delete('loc');
     this._renderNotices();
     this._loc = res;
-    this._renderHeader();
+    this._renderStatus();
     this._maybeUpdateMap();
   }
 
@@ -1560,73 +1570,66 @@ class AmapLocationCard extends HTMLElement {
     const cfg = this._cfg;
     const fill = !!cfg.fill_viewport && !this._inEditorPreview();
     this._fillViewport = fill;
+    // 只保留地图本体：顶部标题栏与底部工具栏都已取消，
+    // 操作入口全部浮在地图右下的控件列上（回到定位 / + / − / 列表），列表点开在后面展开。
+    const cardTitle = String(cfg.title || '').trim();
     this._shadow.innerHTML = `
       <style>${ALC_STYLES}</style>
-      <ha-card class="alc-root${fill ? ' alc-fill' : ''}">
-        <div class="alc-head">
-          <div class="alc-head-main">
-            <div class="alc-title"></div>
-            <div class="alc-sub"></div>
-          </div>
-          <div class="alc-chips"></div>
-        </div>
+      <ha-card class="alc-root${fill ? ' alc-fill' : ''}"${cardTitle ? ` aria-label="${escapeHtml(cardTitle)}"` : ''}>
         <div class="alc-map-wrap"${fill ? '' : ` style="height:${cfg.height}px"`}>
           <div class="alc-map" id="alc-map"></div>
           <div class="alc-gesture" id="alc-gesture"></div>
-          <div class="alc-amap-ctrl" id="alc-amap-ctrl" hidden>
-            <button type="button" class="alc-fm-btn" data-act="zoom-in" aria-label="放大">+</button>
-            <button type="button" class="alc-fm-btn" data-act="zoom-out" aria-label="缩小">−</button>
+          <div class="alc-ctrl" id="alc-ctrl">
+            <button type="button" class="alc-fm-btn" data-act="recenter" aria-label="回到定位" title="回到定位">◎</button>
+            <button type="button" class="alc-fm-btn" data-act="zoom-in" aria-label="放大" title="放大">+</button>
+            <button type="button" class="alc-fm-btn" data-act="zoom-out" aria-label="缩小" title="缩小">−</button>
+            <button type="button" class="alc-fm-btn alc-ctrl-list" data-act="list" aria-label="显示列表" title="显示列表">☰</button>
           </div>
+          <div class="alc-status" id="alc-status"></div>
           <div class="alc-amap-pop" id="alc-amap-pop" hidden></div>
           <div class="alc-notices" id="alc-notices"></div>
           <div class="alc-loading" id="alc-loading" hidden>
             <span class="alc-spinner"></span><span id="alc-loading-text">加载中…</span>
           </div>
         </div>
-        <div class="alc-toolbar" id="alc-toolbar">
-          <button type="button" class="alc-btn" data-act="refresh">刷新</button>
-          <button type="button" class="alc-btn" data-act="recenter">回到定位</button>
-          <button type="button" class="alc-btn" data-act="view"></button>
-          <button type="button" class="alc-btn" data-act="list"></button>
-          <span class="alc-toolbar-status" id="alc-status"></span>
+        <div class="alc-list" id="alc-list" hidden>
+          <div class="alc-list-head">
+            <span class="alc-list-heading">附近结果<b class="alc-list-total" id="alc-list-total"></b></span>
+            <button type="button" class="alc-btn" data-act="view"></button>
+            <button type="button" class="alc-btn" data-act="refresh">刷新</button>
+            <button type="button" class="alc-btn" data-act="list">收起</button>
+          </div>
+          <div class="alc-list-body" id="alc-list-body"></div>
         </div>
-        <div class="alc-list" id="alc-list" hidden></div>
       </ha-card>`;
 
     this._els = {
       root: this._shadow.querySelector('.alc-root'),
-      title: this._shadow.querySelector('.alc-title'),
-      sub: this._shadow.querySelector('.alc-sub'),
-      chips: this._shadow.querySelector('.alc-chips'),
       mapWrap: this._shadow.querySelector('.alc-map-wrap'),
       mapEl: this._shadow.querySelector('#alc-map'),
       notices: this._shadow.querySelector('#alc-notices'),
       loading: this._shadow.querySelector('#alc-loading'),
       loadingText: this._shadow.querySelector('#alc-loading-text'),
-      toolbar: this._shadow.querySelector('#alc-toolbar'),
+      ctrl: this._shadow.querySelector('#alc-ctrl'),
       status: this._shadow.querySelector('#alc-status'),
       list: this._shadow.querySelector('#alc-list'),
+      listHead: this._shadow.querySelector('.alc-list-head'),
+      listBody: this._shadow.querySelector('#alc-list-body'),
+      listTotal: this._shadow.querySelector('#alc-list-total'),
       gesture: this._shadow.querySelector('#alc-gesture'),
       amapPop: this._shadow.querySelector('#alc-amap-pop'),
-      amapCtrl: this._shadow.querySelector('#alc-amap-ctrl'),
     };
     // 地图容器（高德 Map 与简化视图共用同一节点）
     this._mapEl = this._els.mapEl;
     this._built = true;
 
-    // 高德底图手势接管 + 自绘缩放按钮。
+    // 高德底图手势接管 + 自绘控件列。
     // 原因：JSAPI 2.0 的拖拽/缩放管线依赖一个透明 iframe 盾，在 Shadow DOM 内该管线会断
     // （mousedown 后事件全部失踪，地图完全拖不动）—— 因此手势全部由卡片自己接管，
     // 只把渲染交给高德。详见 README「已知问题：JSAPI 2.0 × Shadow DOM」。
+    // 控件列（回到定位 / + / − / 列表）的点击统一走下面的委托处理，两种底图共用。
     this._bindAmapGestures();
-    this._els.amapCtrl.addEventListener('click', (e) => {
-      const b = e.target.closest('button[data-act]');
-      if (!b || !this._map || this._mapMode !== 'amap') return;
-      const z = clamp(toNum(this._map.getZoom()) || 16, 3, 19);
-      // 立即生效：连续快点 +/− 时排队的动画缩放会在 iOS 上把标记层打乱
-      if (b.dataset.act === 'zoom-in') this._map.setZoom(clamp(z + 1, 3, 19), true);
-      if (b.dataset.act === 'zoom-out') this._map.setZoom(clamp(z - 1, 3, 19), true);
-    });
+    this._applyCtrlVisibility();
 
     // 委托点击：兼容 InfoWindow / 列表 / 工具栏 / 简化视图弹窗
     this._onClick = (e) => this._handleDelegatedClick(e);
@@ -1646,7 +1649,6 @@ class AmapLocationCard extends HTMLElement {
       try { window.addEventListener('online', this._onOnline); } catch (e) { /* ignore */ }
     }
 
-    this._renderHeader();
     this._renderNotices();
     this._renderStatus();
   }
@@ -1663,15 +1665,15 @@ class AmapLocationCard extends HTMLElement {
 
   /* ------------------------------------------------------ 搜索半径 */
 
-  /** 自动半径取法：'visible'（内切，默认，结果必在图内）| 'cover'（外接，覆盖整个视口） */
+  /** 自动半径取法：'cover'（外接，默认，覆盖整个可视矩形）| 'visible'（内切，只覆盖画面中间） */
   _radiusBasis() {
-    return (this._cfg && this._cfg.auto_radius_basis === 'cover') ? 'cover' : 'visible';
+    return (this._cfg && this._cfg.auto_radius_basis === 'visible') ? 'visible' : 'cover';
   }
 
   /**
    * 高德地图可视范围半径（米）。
-   *   visible：中心 → 最近边（内切圆），保证圈内每一点都落在可视矩形里
-   *   cover  ：中心 → 最远角（外接圆），保证覆盖整个可视矩形
+   *   cover  ：中心 → 最远角（外接圆），保证整个可视矩形都在检索范围内
+   *   visible：中心 → 最近边（内切圆），只覆盖中间的一块
    */
   _viewportRadiusAMap() {
     const map = this._map;
@@ -1717,8 +1719,10 @@ class AmapLocationCard extends HTMLElement {
   }
 
   /**
-   * 当前实际生效的检索半径。
-   * auto：跟随地图可视范围（缩放越小、视野越大 → 半径越大），并按系数与上限收敛。
+   * 当前实际生效的检索半径（米）。
+   * auto：把「浏览者屏幕上的可视矩形」当成检索范围 —— 取能盖住整个矩形的外接半径，
+   *       再用 auto_radius_pad 外扩、auto_radius_max 收敛。注意上限永远不会小于
+   *       矩形本身，否则屏幕大 / 缩得远时四角就会搜不到。
    * fixed：始终使用配置里的 radius。
    */
   _currentRadius() {
@@ -1728,7 +1732,8 @@ class AmapLocationCard extends HTMLElement {
     const vp = (this._mapMode === 'amap' ? this._viewportRadiusAMap() : null)
       || this._viewportRadiusFallback();
     if (!vp) return cfg.radius;
-    return clamp(Math.round(vp * cfg.auto_radius_pad), 100, cfg.auto_radius_max);
+    const cap = Math.max(cfg.auto_radius_max, vp);
+    return clamp(Math.round(vp * cfg.auto_radius_pad), 100, Math.min(50000, cap));
   }
 
   /**
@@ -1790,6 +1795,12 @@ class AmapLocationCard extends HTMLElement {
 
   /** 统计落在可视范围外的结果，并给出「铺满显示」一键入口 */
   _checkPinsVisible() {
+    // auto 模式：检索范围就是当前视图，结果在 _fetchPois 里已剔除视口外的点；
+    // 偶尔出画只是因为拖动的这几百毫秒里地图动了，松手后会自动重检索 —— 不值得提示。
+    if (this._cfg && this._cfg.radius_mode === 'auto') {
+      if (this._notices.delete('offscreen')) this._renderNotices();
+      return;
+    }
     const pois = (this._pins || []).filter((p) => p.kind !== 'entity');
     const out = pois.filter((p) => !this._pinInView(p));
     if (!out.length) {
@@ -1918,7 +1929,7 @@ class AmapLocationCard extends HTMLElement {
         && this._centerDeltaMeters(this._lastCenter, c) <= Math.max(120, r * 0.25);
       if (r === this._lastRadius && centerSame) return;
       this._syncRadiusCircle(r);
-      this._renderHeader();
+      this._renderStatus();
       if (this._api) this._api.clearPoiCache();   // 基点或半径变了，旧结果不再适用
       this._fetchPois();
     }, 600);
@@ -2082,8 +2093,16 @@ class AmapLocationCard extends HTMLElement {
       } catch (e) { /* ignore */ }
     }
     // 缩放按钮自绘（高德 ToolBar 在 Shadow DOM 下收不到点击）
-    if (this._els.amapCtrl) this._els.amapCtrl.hidden = !cfg.show_toolbar;
+    this._applyCtrlVisibility();
     return true;
+  }
+
+  /** show_toolbar=false 时只留「列表」按钮，缩放与回到定位整条隐藏 */
+  _applyCtrlVisibility() {
+    if (!this._els || !this._els.ctrl) return;
+    const on = !this._cfg || this._cfg.show_toolbar !== false;
+    this._els.ctrl.querySelectorAll('[data-act="recenter"], [data-act="zoom-in"], [data-act="zoom-out"]')
+      .forEach((b) => { b.hidden = !on; });
   }
 
   /* ------------------------------- 高德底图手势接管（拖拽 / 缩放 / 点选） */
@@ -2340,6 +2359,7 @@ class AmapLocationCard extends HTMLElement {
     this._mapEl.style.touchAction = 'none';
     const center = this._initialCenter();
     this._fbMap = new CanvasFallbackMap(this._mapEl, {
+      controls: false,   // 控件列由卡片统一提供（地图右下角），避免两套按钮重叠
       zoom: this._cfg.view_mode === 'locked' ? this._cfg.locked_zoom : this._cfg.follow_zoom,
       centerLng: center[0],
       centerLat: center[1],
@@ -2495,8 +2515,15 @@ class AmapLocationCard extends HTMLElement {
     // 检索全程不显示任何 loading / 遮罩：拖动、缩放触发的重检索要「无感」，
     // 旧数据一直留在图上，新结果回来再原地更新（见 _renderPins 的增量重建）。
     const center = this._searchCenter();    // auto：视野中心（拖动后跟随新视野）；fixed：实体
-    const radius = this._currentRadius();   // auto 模式下跟随地图可视范围
+    const radius = this._currentRadius();   // auto 模式下 = 覆盖整张视图所需的外接半径
     const errors = [];
+
+    /* auto 模式：检索范围就是「这整张地图」。
+       高德周边检索只支持圆形，外接圆是可视矩形的超集，圆内四角方向会多出一批
+       落在画面外的点 —— 这里直接剔掉，让渲染结果精确等于「视图内搜到的 POI」。
+       这样既覆盖了整个视图（不画圈也不漏点），又不会有点跑到地图框外面。
+       fixed 模式是用户指定的固定半径，不做裁剪，只保留原有兜底。 */
+    const clipToView = cfg.radius_mode === 'auto';
 
     const groups = await Promise.all(defs.map(async (d) => {
       try {
@@ -2504,10 +2531,11 @@ class AmapLocationCard extends HTMLElement {
           lng: center.lng, lat: center.lat,
           types: d.types,
           radius,
-          offset: Math.min(25, Math.max(cfg.max_poi, 10)),
+          offset: 25,                          // 取满一页，裁掉视口外的点后仍能贴住 max_poi
         });
         const items = pois
           .map((p) => buildPoiView(p, { kind: d.kind, icon: d.icon, center, cfg }))
+          .filter((it) => !clipToView || this._pinInView({ lng: it.poi.lng, lat: it.poi.lat }))
           .sort((a, b) => a.distance - b.distance)
           .slice(0, cfg.max_poi);
         return Object.assign({}, d, { items, error: null });
@@ -2531,7 +2559,6 @@ class AmapLocationCard extends HTMLElement {
     // 搜不到时保持安静：不弹提示条、不改标题，地图上只留实体点（用户明确要求）
     this._notices.delete('poi-empty');
 
-    this._renderHeader();
     this._renderPins();
     this._checkPinsVisible();   // 结果跑出可视范围时给出「铺满显示」入口
     this._renderList();
@@ -2814,7 +2841,18 @@ class AmapLocationCard extends HTMLElement {
       return;
     }
 
-    if (toolbarAct === 'refresh') { this._api.clearCache(); this._refresh(true); return; }
+    if (toolbarAct === 'zoom-in' || toolbarAct === 'zoom-out') {
+      const dz = toolbarAct === 'zoom-in' ? 1 : -1;
+      if (this._map && this._mapMode === 'amap') {
+        const z = clamp(toNum(this._map.getZoom()) || 16, 3, 19);
+        // 立即生效：连续快点 +/− 时排队的动画缩放会在 iOS 上把标记层打乱
+        this._map.setZoom(clamp(z + dz, 3, 19), true);
+      } else if (this._fbMap) {
+        this._fbMap.setZoom(this._fbMap.zoom + dz);
+      }
+      return;
+    }
+    if (toolbarAct === 'refresh') { if (this._api) this._api.clearCache(); this._refresh(true); return; }
     if (toolbarAct === 'recenter') { this._applyView(true); return; }
     if (toolbarAct === 'view') {
       const mode = this._viewOverride || this._cfg.view_mode;
@@ -2843,11 +2881,18 @@ class AmapLocationCard extends HTMLElement {
     this._onPinClick(pin);
   }
 
+  /** 展开 / 收起列表：列表在地图下方展开（铺满窗口时地图自动让出高度） */
   _showList(open) {
     this._listOpen = !!open;
     this._els.list.hidden = !open;
     if (open) this._renderList();
     this._renderStatus();
+    // 展开列表会改变地图高度 → 触发一次视野变化。这里只重排画布、不按新视野重新检索：
+    // 否则刚展开的列表会被「变小后的可见矩形」当场裁掉一半。
+    this._suppressViewportRefetch = true;
+    clearTimeout(this._listResizeTimer);
+    this._resizeMap();
+    this._listResizeTimer = setTimeout(() => { this._suppressViewportRefetch = false; }, 1200);
   }
 
   /* -------------------------------------------------------- 渲染 UI */
@@ -2892,63 +2937,65 @@ class AmapLocationCard extends HTMLElement {
     });
   }
 
-  _renderHeader() {
-    if (!this._els) return;
-    const cfg = this._cfg;
-    const showHead = !!(cfg.title || this._hass);
-    this._els.root.querySelector('.alc-head').style.display = showHead ? '' : 'none';
-    this._els.title.textContent = cfg.title || this._entityName();
-    const subParts = [];
-    subParts.push('WGS84 → GCJ02');
-    const r = this._lastRadius || this._currentRadius();
-    if (cfg.radius_mode === 'auto') {
-      const how = this._radiusBasis() === 'cover' ? '覆盖整个视口' : '限可见范围内';
-      subParts.push(`半径 ${r} m（自动 · ${how}）`);
-    } else {
-      subParts.push(`半径 ${r} m`);
-    }
-    this._els.sub.textContent = subParts.join(' · ');
-  }
-
+  /**
+   * 状态信息：坐标 / 坐标系判定 / 搜索范围 / 刷新时间。
+   * 顶部标题栏已取消，这些信息收进地图左上角的一枚半透明小标签（不挡操作、不占高度）。
+   */
   _renderStatus() {
     if (!this._els || !this._els.status) return;
     const cfg = this._cfg;
     const mode = this._viewOverride || cfg.view_mode;
-    const modeLabel = mode === 'follow' ? '跟随中' : '已锁定';
     const paused = mode === 'follow' && Date.now() - this._userPannedAt < 15000;
 
-    const viewBtn = this._els.toolbar.querySelector('[data-act="view"]');
-    if (viewBtn) viewBtn.textContent = paused ? '恢复跟随' : modeLabel;
+    // 跟随切换按钮住在展开后的列表头部（顶部工具栏已取消，避免地图上再堆一排按钮）
+    const viewBtn = this._els.listHead && this._els.listHead.querySelector('[data-act="view"]');
+    if (viewBtn) viewBtn.textContent = paused ? '恢复跟随' : (mode === 'follow' ? '跟随中' : '已锁定');
 
-    const listBtn = this._els.toolbar.querySelector('[data-act="list"]');
+    const listBtn = this._els.ctrl && this._els.ctrl.querySelector('[data-act="list"]');
     if (listBtn) {
-      const n = (this._poiGroups || []).reduce((s, g) => s + g.items.length, 0);
-      listBtn.textContent = this._listOpen ? '收起列表' : `列表 (${n})`;
+      const label = this._listOpen ? '收起列表' : '显示列表';
+      listBtn.setAttribute('aria-label', label);
+      listBtn.setAttribute('title', label);
+      listBtn.classList.toggle('on', !!this._listOpen);
     }
+    const headBtn = this._els.listHead && this._els.listHead.querySelector('[data-act="list"]');
+    if (headBtn) headBtn.textContent = '收起';
 
     const bits = [];
     if (this._gcj) bits.push(`${this._gcj.lng.toFixed(4)}, ${this._gcj.lat.toFixed(4)}`);
     bits.push(this._convertViaLabel());
+    const r = this._lastRadius || this._currentRadius();
+    if (cfg.radius_mode === 'auto') {
+      // auto = 把屏幕可视矩形当检索范围（外接半径 + 视口裁剪，等价于矩形检索）
+      const how = this._radiusBasis() === 'cover' ? '整屏矩形' : '内切圆';
+      bits.push(`${how} · 约 ${r} m`);
+    } else {
+      bits.push(`半径 ${r} m`);
+    }
     if (this._lastRefresh) {
       const d = new Date(this._lastRefresh);
       bits.push(`${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`);
-
     }
     if (cfg.show_debug && this._api) {
       bits.push(`请求 ${this._api.stats.request} / 命中 ${this._api.stats.cacheHit} / 失败 ${this._api.stats.error}`);
     }
-    this._els.status.textContent = bits.join(' · ');
+    const text = bits.join(' · ');
+    this._els.status.textContent = text;
+    this._els.status.title = text;
+    this._els.status.hidden = !text;
   }
 
   _renderList() {
-    if (!this._els || !this._els.list) return;
+    if (!this._els || !this._els.listBody) return;
     const cfg = this._cfg;
     const groups = this._poiGroups || [];
+    const total = groups.reduce((s, g) => s + g.items.length, 0);
+    if (this._els.listTotal) this._els.listTotal.textContent = total ? String(total) : '';
     if (!groups.length) {
-      this._els.list.innerHTML = '<div class="alc-empty">暂无检索结果</div>';
+      this._els.listBody.innerHTML = '<div class="alc-empty">暂无检索结果</div>';
       return;
     }
-    this._els.list.innerHTML = groups.map((g) => {
+    this._els.listBody.innerHTML = groups.map((g) => {
       if (!g.items.length) {
         return `<div class="alc-list-group">
           <div class="alc-list-title">${iconHtml(g.icon, 18)}<span>${escapeHtml(g.label)}</span></div>
@@ -3011,7 +3058,7 @@ const ALC_EDITOR_SECTIONS = [
         ['wgs84', 'WGS-84 / GPS（默认 · 走高德纠偏）'],
         ['gcj02', 'GCJ-02 / 高德坐标（不纠偏，直接用）'],
       ], hint: '坐标来自 GPS 模块、HA Companion App 等 → 选 WGS-84；来自高德/腾讯等国内 App 上报（本身已是高德坐标）→ 必须选 GCJ-02，否则所有点会在高德底图上整体偏移约 300~600 米' },
-      { key: 'title', label: '卡片标题', type: 'text', hint: '留空则显示实体名称' },
+      { key: 'title', label: '卡片标题（无障碍标签）', type: 'text', hint: '顶部标题栏已取消；这里只作为读屏/悬浮提示用的名称，留空则用实体名称' },
       { key: 'height', label: '地图高度（px）', type: 'number', min: 120, max: 1200, dependsOn: { fill_viewport: false }, hint: '仅在关闭「铺满窗口」时生效' },
       { key: 'fill_viewport', label: '铺满浏览器窗口', type: 'boolean', hint: '开：地图自动撑满可视区域高度（配置编辑器的预览不会铺满）；关：使用上面的固定高度' },
       { key: 'view_mode', label: '视图模式', type: 'select', options: [['follow', '自动跟随实体居中'], ['locked', '手动锁定视图']] },
@@ -3036,14 +3083,14 @@ const ALC_EDITOR_SECTIONS = [
   {
     title: '周边检索', open: false,
     fields: [
-      { key: 'radius_mode', label: '搜索范围', type: 'select', options: [['auto', '自动 · 跟随地图当前缩放范围'], ['fixed', '固定半径']], hint: '自动模式下地图缩放会改变检索范围，搜索圈与结果同步更新' },
+      { key: 'radius_mode', label: '搜索范围', type: 'select', options: [['auto', '自动 · 整张地图的可视范围'], ['fixed', '固定半径']], hint: '自动模式按当前地图可视范围检索，缩放/拖动后自动重搜' },
       { key: 'radius', label: '固定搜索半径（米）', type: 'number', min: 50, max: 50000, dependsOn: { radius_mode: 'fixed' } },
       { key: 'auto_radius_basis', label: '自动范围取法', type: 'select', dependsOn: { radius_mode: 'auto' }, options: [
-        ['visible', '限可见范围内（推荐 · 结果都落在图上）'],
-        ['cover', '覆盖整个视口（四角方向的结果会出图）'],
-      ], hint: 'visible = 内切半径，检索圈整个落在画面里，每条结果都看得见；cover = 外接半径，覆盖整个视口但部分结果会落在画面外（卡片会给「铺满显示」提示）' },
-      { key: 'auto_radius_pad', label: '自动范围系数', type: 'number', min: 0.2, max: 4, step: 0.1, dependsOn: { radius_mode: 'auto' }, hint: '1.0 = 恰好贴到可视边缘；小于 1 收紧，大于 1 向外多搜一圈（可能出图）' },
-      { key: 'auto_radius_max', label: '自动范围上限（米）', type: 'number', min: 100, max: 50000, step: 100, dependsOn: { radius_mode: 'auto' }, hint: '地图缩得很远时避免检索范围撑得过大，默认 5000' },
+        ['cover', '覆盖整个视图（默认 · 视野内不漏点）'],
+        ['visible', '只覆盖画面中间（内切圆）'],
+      ], hint: '默认 cover：用能盖住整张地图的外接半径去搜，再把视口外的结果剔掉 —— 地图上看得到的 POI 一定能搜到，地图上也不会出现框外的点。visible 只搜画面中心的一块（宽屏时两侧会漏）。' },
+      { key: 'auto_radius_pad', label: '自动范围系数', type: 'number', min: 0.2, max: 4, step: 0.1, dependsOn: { radius_mode: 'auto' }, hint: '1.0 = 恰好盖住整张地图；小于 1 收紧（四角可能漏），大于 1 向外多搜一圈' },
+      { key: 'auto_radius_max', label: '自动范围上限（米）', type: 'number', min: 100, max: 50000, step: 100, dependsOn: { radius_mode: 'auto' }, hint: '地图缩得很远时避免检索范围撑得过大，默认 5000；缩到很小时四角可能覆盖不到' },
       { key: 'show_charging', label: '显示充电桩', type: 'boolean', hint: '周边搜索 types=011100（充电设施）' },
       { key: 'charging_type', label: '充电桩 POI 类型码', type: 'text', dependsOn: { show_charging: true }, placeholder: '011100' },
       { key: 'show_charging_price', label: '充电桩弹窗显示电价', type: 'boolean', dependsOn: { show_charging: true } },
@@ -3051,7 +3098,7 @@ const ALC_EDITOR_SECTIONS = [
       { key: 'show_toilet', label: '显示公共厕所', type: 'boolean', hint: '周边搜索 types=140306（公共厕所）' },
       { key: 'toilet_type', label: '公共厕所 POI 类型码', type: 'text', dependsOn: { show_toilet: true }, placeholder: '140306' },
       { key: 'max_poi', label: '每类最多显示（1-25）', type: 'number', min: 1, max: 25 },
-      { key: 'show_radius_circle', label: '显示搜索半径圈', type: 'boolean' },
+      { key: 'show_radius_circle', label: '显示搜索半径圈', type: 'boolean', hint: '默认关闭。检索范围本来就是整张地图的可视区域，不需要额外画圈。' },
     ],
   },
   {
@@ -3068,7 +3115,7 @@ const ALC_EDITOR_SECTIONS = [
         ['amap://styles/graffiti', '涂鸦'], ['amap://styles/macaron', '马卡龙'],
       ] },
       { key: 'show_source_marker', label: '显示实体主图标', type: 'boolean' },
-      { key: 'show_toolbar', label: '显示地图自带工具条', type: 'boolean' },
+      { key: 'show_toolbar', label: '显示缩放 / 回到定位按钮', type: 'boolean', hint: '关闭后地图右下角只留「列表」按钮' },
       { key: 'show_scale', label: '显示比例尺', type: 'boolean', dependsOn: { show_toolbar: true } },
       { key: 'click_action', label: '点击标记行为', type: 'select', options: [['popup', '弹出信息窗'], ['navigate', '直接唤起高德导航']] },
       { key: 'open_in_new_tab', label: '外部链接在新标签打开', type: 'boolean' },
@@ -3398,17 +3445,10 @@ const ALC_STYLES = `
 ha-card { overflow:hidden; }
 .alc-root { --alc-radius: var(--ha-card-border-radius, 12px); position:relative; }
 
-.alc-head { display:flex; align-items:flex-start; gap:8px; padding:12px 16px 8px; }
-.alc-head-main { min-width:0; flex:1 1 auto; }
-.alc-title { font-size:16px; font-weight:500; color:var(--primary-text-color); line-height:1.3;
-  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.alc-sub { font-size:12px; color:var(--secondary-text-color); margin-top:2px; }
-.alc-chips { display:flex; flex-wrap:wrap; gap:4px; justify-content:flex-end; }
-
-/* overflow:hidden —— 标记/弹窗一律裁剪在地图框内，绝不溢出到工具栏或页面上 */
+/* overflow:hidden —— 标记/弹窗一律裁剪在地图框内，绝不溢出到页面上 */
 .alc-map-wrap { position:relative; overflow:hidden; background:var(--secondary-background-color, #e9edf2); }
 
-/* 铺满窗口：卡片撑满视口高度，地图吃掉除头/工具栏外的剩余空间。
+/* 铺满窗口：卡片撑满视口高度，地图吃掉除「展开的列表」外的全部空间。
    HA 配置编辑器里的预览不加 .alc-fill（见 _inEditorPreview），保持原高度不撑爆面板。 */
 .alc-root.alc-fill { display:flex; flex-direction:column; height:100vh; height:100dvh; }
 .alc-root.alc-fill .alc-map-wrap { flex:1 1 auto; min-height:160px; }
@@ -3421,9 +3461,21 @@ ha-card { overflow:hidden; }
 .alc-gesture { position:absolute; inset:0; z-index:10; cursor:grab; }
 .alc-gesture:active { cursor:grabbing; }
 
-/* 高德底图模式的自绘缩放按钮（ToolBar 在 Shadow DOM 下不可点） */
-.alc-amap-ctrl { position:absolute; right:8px; bottom:8px; display:flex; flex-direction:column; gap:4px; z-index:11; }
-.alc-amap-ctrl[hidden] { display:none; }
+/* 地图右下角控件列：回到定位 → + → − → 列表（两种底图共用。
+   高德自带 ToolBar 在 Shadow DOM 下不可点，所以这里全自绘） */
+.alc-ctrl { position:absolute; right:8px; bottom:8px; display:flex; flex-direction:column;
+  gap:5px; z-index:21; }
+.alc-ctrl-list { font-size:15px; line-height:1; }
+.alc-ctrl-list.on { background:var(--primary-color,#03a9f4); color:#fff; border-color:transparent; }
+
+/* 状态标签：原顶部标题栏取消后，坐标/坐标系/搜索范围/刷新时间收进地图左上角 */
+.alc-status { position:absolute; left:8px; top:8px; max-width:calc(100% - 96px); z-index:11;
+  font-size:10.5px; line-height:1.35; color:var(--primary-text-color);
+  padding:3px 8px; border-radius:8px; pointer-events:none;
+  background:color-mix(in srgb, var(--card-background-color,#fff) 78%, transparent);
+  backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px);
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; opacity:.8; }
+.alc-status[hidden] { display:none; }
 
 /* 高德底图模式的自绘弹窗（替代 InfoWindow） */
 .alc-amap-pop { position:absolute; transform:translate(-50%,-100%); z-index:12; }
@@ -3451,7 +3503,7 @@ ha-card { overflow:hidden; }
 .alc-icon-img { object-fit:contain; }
 
 /* 提示条 */
-.alc-notices { position:absolute; left:8px; right:8px; bottom:8px; display:flex; flex-direction:column;
+.alc-notices { position:absolute; left:8px; right:52px; bottom:8px; display:flex; flex-direction:column;
   gap:6px; pointer-events:none; z-index:30; }
 .alc-notice { pointer-events:auto; display:flex; align-items:center; gap:8px;
   padding:7px 10px; border-radius:10px; font-size:12px; line-height:1.35;
@@ -3476,19 +3528,22 @@ ha-card { overflow:hidden; }
   border-top-color:transparent; animation:alc-spin .8s linear infinite; }
 @keyframes alc-spin { to { transform:rotate(360deg); } }
 
-/* 工具条 */
-.alc-toolbar { display:flex; align-items:center; gap:6px; flex-wrap:wrap; padding:8px 12px; }
+/* 列表头部的按钮（列表展开后才出现；顶部工具栏已取消，刷新/跟随切换收在这里） */
 .alc-btn { border:1px solid var(--divider-color, rgba(0,0,0,.12)); background:transparent;
-  color:var(--primary-text-color); border-radius:8px; padding:5px 10px; font-size:12px;
+  color:var(--primary-text-color); border-radius:8px; padding:4px 9px; font-size:11.5px;
   cursor:pointer; -webkit-tap-highlight-color:transparent; }
 .alc-btn:active { background:var(--secondary-background-color, rgba(0,0,0,.06)); }
-.alc-toolbar-status { margin-left:auto; font-size:11px; color:var(--secondary-text-color);
-  font-variant-numeric:tabular-nums; }
 
-/* 附近列表 */
-.alc-list { max-height:320px; overflow-y:auto; -webkit-overflow-scrolling:touch;
-  border-top:1px solid var(--divider-color, rgba(0,0,0,.10)); padding:4px 12px 12px; }
+/* 附近列表：点「列表」按钮后在下方展开（铺满窗口时地图让出高度，列表自己滚动） */
+.alc-list { display:flex; flex-direction:column; max-height:320px; min-height:0;
+  border-top:1px solid var(--divider-color, rgba(0,0,0,.10)); }
 .alc-list[hidden] { display:none; }
+.alc-list-head { display:flex; align-items:center; gap:6px; padding:8px 12px 6px; flex:0 0 auto; }
+.alc-list-heading { flex:1 1 auto; min-width:0; font-size:12px; font-weight:500;
+  color:var(--secondary-text-color); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.alc-list-total { margin-left:5px; font-weight:600; color:var(--primary-text-color); }
+.alc-list-body { flex:1 1 auto; min-height:0; overflow-y:auto; -webkit-overflow-scrolling:touch;
+  padding:0 12px 12px; }
 .alc-list-group + .alc-list-group { margin-top:10px; }
 .alc-list-title { display:flex; align-items:center; gap:6px; font-size:12px; font-weight:500;
   color:var(--secondary-text-color); padding:8px 0 4px; }
@@ -3543,7 +3598,7 @@ ha-card { overflow:hidden; }
 .alc-fm-btn { width:30px; height:30px; border-radius:8px; border:none; cursor:pointer;
   background:var(--card-background-color,#fff); color:var(--primary-text-color); font-size:15px;
   box-shadow:0 2px 8px rgba(0,0,0,.2); line-height:1; }
-.alc-fm-badge { position:absolute; left:8px; top:8px; font-size:10.5px; padding:3px 8px; border-radius:8px;
+.alc-fm-badge { position:absolute; right:8px; top:8px; font-size:10.5px; padding:3px 8px; border-radius:8px;
   background:var(--card-background-color,rgba(255,255,255,.9)); color:var(--secondary-text-color);
   box-shadow:0 1px 4px rgba(0,0,0,.14); }
 .alc-fm-popup { position:absolute; transform:translate(-50%,-100%); z-index:40; }
