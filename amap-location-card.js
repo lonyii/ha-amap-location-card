@@ -1134,6 +1134,11 @@ function openExternal(url, newTab) {
     try { win.opener = null; } catch (e) { /* 跨域窗口可能不允许写，忽略 */ }
     return true;
   }
+  // ①b 返回 null 但页面已经被盖住（新的 WebView / 前台视图已经起来了）→ 认为已经开过，
+  //     绝不能再走兜底，否则就是「新标签页开一次 + 原页面又跳一次」的双跳。
+  try {
+    if (document.visibilityState === 'hidden' || document.hasFocus() === false) return true;
+  } catch (e) { /* ignore */ }
   // ② 被弹窗拦截（App 内嵌 WebView 常见）→ 用临时 <a target="_blank"> 触发，等价于用户按住新标签打开
   try {
     const host = document.body || document.documentElement;
