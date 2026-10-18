@@ -111,7 +111,7 @@ const ALC_DEFAULTS = {
   /* 交互 */
   click_action: 'popup',          // popup（弹窗）| navigate（直接唤起导航）
   show_list: false,
-  open_in_new_tab: true,          // true = window.open 保留 HA 面板；false = 当前页跳转
+  open_in_new_tab: true,          // true = 新标签页打开（原页面不跳转）；false = 当前页跳转
 
   /* 性能与容错 */
   coord_cache_ttl: 300,           // 坐标转换缓存（秒）
@@ -1112,19 +1112,46 @@ function buildNavigationUrl({ fromLng, fromLat, fromName, toLng, toLat, toName, 
 /**
  * 打开外部链接
  * @param {string} url
- * @param {boolean} newTab true = 新标签页打开（保留 HA 面板）；false = 当前页面直接跳转
- *        （部分 iOS 环境下直接跳转更能可靠唤起高德 App，故保留为可配置项）
+ * @param {boolean} newTab true（默认）= 新标签页/新窗口打开，**原页面绝不跳转**；
+ *        false = 当前页面直接跳转（部分 iOS 环境唤起高德 App 更可靠，故保留为可配置项）
+ * @returns {boolean} 是否已交给新标签页（false = 浏览器拦得死死的，什么都没做）
+ *
+ * 注意：**不能**用 `window.open(url, '_blank', 'noopener')` 的返回值判断是否被拦截 ——
+ * 按 HTML 规范，带 `noopener` 时 window.open 一律返回 null。旧实现据此误判成「被拦截」
+ * 然后 `location.href = url` 跳转，结果就是点一下 POI 标签整张 HA 面板被高德页面顶掉。
+ * 现在：先 window.open（不带 noopener，事后把 opener 置空）→ 被拦则用临时
+ * `<a target="_blank" rel="noopener noreferrer">` 再试一次 → 都不行就什么也不做（绝不顶掉原页面）。
  */
 function openExternal(url, newTab) {
-  if (!url) return;
+  if (!url) return false;
   if (newTab === false) {
-    try { window.location.href = url; return; } catch (e) { /* 继续尝试 window.open */ }
+    try { window.location.href = url; return false; } catch (e) { /* ignore */ }
   }
+  // ① window.open：不带 noopener（否则返回值恒为 null，见上）
   let win = null;
-  try { win = window.open(url, '_blank', 'noopener'); } catch (e) { win = null; }
-  if (!win) {
-    try { window.location.href = url; } catch (e) { /* ignore */ }
+  try { win = window.open(url, '_blank'); } catch (e) { win = null; }
+  if (win) {
+    try { win.opener = null; } catch (e) { /* 跨域窗口可能不允许写，忽略 */ }
+    return true;
   }
+  // ② 被弹窗拦截（App 内嵌 WebView 常见）→ 用临时 <a target="_blank"> 触发，等价于用户按住新标签打开
+  try {
+    const host = document.body || document.documentElement;
+    if (host && document.createElement) {
+      const a = document.createElement('a');
+      a.href = url;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      a.referrerPolicy = 'no-referrer';
+      a.style.display = 'none';
+      host.appendChild(a);
+      a.click();
+      if (a.parentNode) a.parentNode.removeChild(a);
+      return true;
+    }
+  } catch (e) { /* 落到 ③ */ }
+  // ③ 都不行：保持原页面不动（宁可没打开，也不能把用户的 HA 面板换成高德页面）
+  return false;
 }
 
 /* =============================================================================
@@ -3779,7 +3806,7 @@ const ALC_EDITOR_SECTIONS = [
       { key: 'show_toolbar', label: '显示缩放 / 回到定位按钮', type: 'boolean', hint: '关闭后地图右下角只留「列表」按钮' },
       { key: 'show_scale', label: '显示比例尺', type: 'boolean', dependsOn: { show_toolbar: true } },
       { key: 'click_action', label: '点击标记行为', type: 'select', options: [['popup', '弹出信息窗'], ['navigate', '直接唤起高德导航']] },
-      { key: 'open_in_new_tab', label: '外部链接在新标签打开', type: 'boolean' },
+      { key: 'open_in_new_tab', label: '外部链接在新标签打开', type: 'boolean', hint: '开（默认）：点「高德导航 / 地图标注」在新标签页打开，原页面（HA 面板）保持不动；关：当前页直接跳转，回来要重新进面板' },
       { key: 'show_list', label: '默认展开附近列表', type: 'boolean' },
     ],
   },
