@@ -1,0 +1,14 @@
+node_modules/
+package-lock.json
+.DS_Store
+*.log
+__pycache__/
+
+# ---- 本地文件（不发布）----
+# 演示页内含本地调试用的高德 Key，绝不外发
+demo.html
+.smoke-test.cjs
+.dom-test.cjs
+.demo-check.cjs
+.geo-audit.cjs
+*.png

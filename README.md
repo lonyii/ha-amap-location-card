@@ -19,6 +19,7 @@
 - [完整配置项](#完整配置项)
 - [坐标转换接口（强制走高德 Web 服务）](#坐标转换接口强制走高德-web-服务)
 - [搜索范围：跟随地图当前缩放](#搜索范围跟随地图当前缩放)
+- [夜间主题（v1.2.0）](#夜间主题v120)
 - [需求对照表](#需求对照表)
 - [重要限制与合规提醒](#重要限制与合规提醒)
 - [iPhone Safari 兼容说明](#iphone-safari-兼容说明)
@@ -255,6 +256,38 @@ icon_toilet: mdi:human-male-female
 实体侧无需任何配置，主流车辆 / 手机集成上报的 `heading` 都能直接用。
 demo 验收页左栏有「朝向 heading」输入框，填个角度就能看到箭头实时转。
 
+### 夜间主题（v1.2.0）
+
+`theme` 一个开关管三处配色，`auto`（默认）时**优先跟随 HA 的深色模式**：
+
+| 配置 | 行为 |
+| --- | --- |
+| `theme: auto`（默认） | HA 切深色 → 卡片跟着变夜间；HA 取不到主题信息再看系统 `prefers-color-scheme` |
+| `theme: dark` | 强制夜间（HA 是浅色也夜间） |
+| `theme: light` | 强制白天（HA 是深色也白天） |
+
+夜间时三处一起变：
+
+1. **高德底图**：换暗色样式。默认规则是白天用「标准」就换幻影黑（`darkblue`）；
+   你特意选了草色青 / 马卡龙这类自定义样式时不被覆盖，想换就用 `night_map_style` 显式指定；
+   切换走 `setMapStyle` 就地重绘，**视野、标记、弹窗全部保留**，不重建地图。
+2. **瓦片底图 / 简化视图**：高德栅格瓦片只有浅色版本，canvas 绘制时用
+   `invert + hue-rotate` 反色成标准暗色地图观感（不支持 canvas 滤镜的老 WebView
+   自动退回半透明暗罩，至少不刺眼）。
+3. **卡片配色**：弹窗、列表、提示条、标记底色转深。`auto` 模式下**不动 HA 自己的主题变量**
+   —— 你的自定义 HA 主题（米色、护眼绿…）不会被卡片吞掉；只有显式 `dark` / `light`
+   才强制覆盖卡片内配色。
+
+两个实现细节，也是踩坑记录：
+
+- **为什么不用 CSS `@media (prefers-color-scheme: dark)`**：HA 用户可以手动把前端切成
+  深色而系统仍是浅色，media query 这时就给错答案。所以主题由 JS 判定
+  （`hass.themes.darkMode` 优先）后用 class 落到根节点上，HA 里切深色**只推 hass 也立即生效**。
+- 判定结果有缓存比对，`hass` 每秒刷好几次也不会反复 `setMapStyle`。
+
+demo 验收页左栏有「夜间主题」下拉和「HA 深色模式」勾选框：勾选它地图立即转夜间，
+不用重建卡片 —— 正好演示 HA 里手动切深色的真实路径。
+
 ### 全屏显示规则（对齐 ha-map-card-recode）
 
 高度规则参照 [lonyii/ha-map-card-recode](https://github.com/lonyii/ha-map-card-recode) 的
@@ -308,6 +341,8 @@ map_height: "100%"                     # 跟随父容器高度（panel 视图 / 
 | `locked_center` | string | — | 锁定中心 `经度,纬度` |
 | `locked_zoom` | number | `15` | 锁定模式缩放级别 3–19 |
 | `map_style` | string | `amap://styles/normal` | 高德地图样式 URI |
+| `theme` | `auto` / `light` / `dark` | `auto` | **夜间主题**（v1.2.0）：`auto` 优先跟随 HA 的深色模式（你在 HA 里手动切深色也认，取不到再看系统设置），`dark` / `light` 强制夜间 / 白天。夜间时底图换暗色样式、瓦片底图自动反色、卡片配色转深，详见上文「夜间主题」 |
+| `night_map_style` | string | —（自动） | 夜间底图样式 URI。留空 = 白天还是默认样式才换幻影黑（`darkblue`），你自定义过样式则沿用不被覆盖；填了则夜间一律用它。仅 `theme` 不为 `light` 时有意义 |
 | `gesture` | `map` / `scroll` | `map` | `map` 地图吃掉手势（iOS 推荐）；`scroll` 页面纵向滚动优先 |
 | `show_source_marker` | boolean | `true` | 显示实体主图标 |
 | `show_radius_circle` | boolean | `false` | 显示搜索半径圈。默认关闭：搜索范围就是整张地图的可视矩形，画圈只会多一层视觉噪音 |
@@ -660,6 +695,9 @@ JS API：v2.0 · https://webapi.amap.com/maps
 
 | 现象 | 可能原因与处理 |
 | --- | --- |
+| **HA 切了深色，卡片/底图还是浅的** | `theme` 被显式设成了 `light`（显式优先于 HA），或 HA 版本较老、`hass.themes.darkMode` 取不到且系统是浅色。前者把 `theme` 改回 `auto`；后者确认系统/浏览器开了深色，或直接 `theme: dark` |
+| **夜间地图没有变暗** | 只有底图渲染出来才会跟主题：高德底图夜间换 `darkblue`（自定义了 `map_style` 且没配 `night_map_style` 时不换）；瓦片底图用 canvas 反色，个别老 WebView 不支持滤镜时退回暗罩，效果是「变暗」而非「黑底」 |
+| **夜间样式闪一下又变回去** | 检查是否同时配了会重置样式的自动化（如「主题切换」自动化反复触发 hass 推送）。卡片自身只在主题真变化时才 `setMapStyle`，不会自己抖 |
 | **卡片报「Custom element doesn't exist: amap-scout」** | 说明页面上跑的还是 v1.0.x 的旧文件（旧版只注册 `amap-location-card`），或者资源 URL 指向的文件不存在。①先确认 `config/www/` 里有新版 `amap-location-card.js`（并清缓存）；②若资源填的是 `/local/ha-amap-scout.js`，同目录必须也有 `amap-location-card.js`（新路径只是个转发入口）。v1.1.1 起老路径不用改，覆盖同名文件即可 |
 | 提示「高德 Key 无效或未开通该服务」 | Key 填错或不支持 Web 服务，请在控制台确认该 Key 的可用服务 |
 | 提示「缺少安全密钥」/ `INVALID_USER_SCODE` | 底图需要：填 `security_js_code`（控制台「Key 详情」里的安全密钥） |
@@ -754,9 +792,9 @@ node --check amap-location-card.js
 **仅本地保留，不随仓库发布**。本地运行方式：
 
 ```bash
-node .smoke-test.cjs   # 222 项：坐标校验 / 距离 / 缓存 / 节流 / POI 解析 / 链接构造 / 降级链 / 转换响应侧校验 / infocode 映射 / 底图失败诊断 / 投影 / 半径配置 / 朝向箭头 / 命名与旧 tag 兼容
-node .dom-test.cjs     # 375 项：jsdom 真实渲染 —— 两种地图分支 / 标记 / 弹窗 / 列表 / 事件委托 / 编辑器（含控件升级不得定时重建）/ 自动半径与拖动重搜 / 转换异常降级 / 建图抛错 / 联网自动重试 / 回到定位 / heading 箭头 / 旧 tag 别名 / 生命周期（需 npm i jsdom）
-node .demo-check.cjs   # 81 项：demo 页 DOM 引用完整性、预填 Key 与坐标、脚本语法、配置项拼写、失败可排查性
+node .smoke-test.cjs   # 249 项：坐标校验 / 距离 / 缓存 / 节流 / POI 解析 / 链接构造 / 降级链 / 转换响应侧校验 / infocode 映射 / 底图失败诊断 / 投影 / 半径配置 / 朝向箭头 / 夜间主题 / 命名与旧 tag 兼容
+node .dom-test.cjs     # 399 项：jsdom 真实渲染 —— 两种地图分支 / 标记 / 弹窗 / 列表 / 事件委托 / 编辑器（含控件升级不得定时重建）/ 自动半径与拖动重搜 / 转换异常降级 / 建图抛错 / 联网自动重试 / 回到定位 / heading 箭头 / 夜间主题 / 旧 tag 别名 / 生命周期（需 npm i jsdom）
+node .demo-check.cjs   # 86 项：demo 页 DOM 引用完整性、预填 Key 与坐标、脚本语法、配置项拼写、失败可排查性
 node .geo-audit.cjs    # 几何审计：自动半径内切 / 外接、结果是否出框，退出码非 0 即几何逻辑坏了
 ```
 

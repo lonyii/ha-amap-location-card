@@ -1,0 +1,11 @@
+# 批处理必须是 CRLF，否则 cmd.exe 会把行切碎（'ows' / '~dp0"' 之类报错）
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 其余文本统一 LF，避免 Windows 下反复出现换行警告
+*.sh   text eol=lf
+*.js   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf

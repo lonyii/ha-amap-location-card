@@ -16,7 +16,7 @@
  *   · iPhone Safari：touch-action 手势治理、固定 px 高度、WebGL 探测、点击兜底
  * ============================================================================= */
 
-const ALC_VERSION = '1.1.1';
+const ALC_VERSION = '1.2.0';
 const ALC_CARD_TAG = 'amap-scout';
 const ALC_EDITOR_TAG = 'amap-scout-editor';
 
@@ -78,6 +78,12 @@ const ALC_DEFAULTS = {
   locked_center: '',              // "经度,纬度"
   locked_zoom: 15,
   map_style: 'amap://styles/normal',
+  /* 夜间主题：auto = 跟随 HA 主题（hass.themes.darkMode），取不到再看系统 prefers-color-scheme；
+   *           dark / light = 强制暗色 / 浅色。夜间除了卡片配色，底图也会换成暗色样式。 */
+  theme: 'auto',
+  /* 夜间底图样式。留空 = 自动（白天是默认样式就换 darkblue，用户自定义过则沿用）；
+   * 填了则夜间一律用这个样式。 */
+  night_map_style: '',
   gesture: 'map',                 // map（地图吃掉手势）| scroll（纵向滚动优先）
   show_source_marker: true,
   // 高德 JS 底图渲染不出来时（iOS App 内嵌 WKWebView 常见）自动切「瓦片底图」：
@@ -256,6 +262,47 @@ function headingChanged(a, b) {
   if (a === null || b === null) return true;
   const d = Math.abs((((b - a) % 360) + 540) % 360 - 180);
   return d >= 1;
+}
+
+/** 夜间主题默认使用的底图样式（normal 时才会自动替换，见 effectiveMapStyle） */
+const ALC_NIGHT_MAP_STYLE = 'amap://styles/darkblue';
+
+/**
+ * 解析「当前该不该用夜间主题」。
+ * 优先级：显式配置 dark/light → HA 主题（hass.themes.darkMode）→ 系统 prefers-color-scheme。
+ *
+ * 为什么 HA 主题优先于系统：HA 用户可以手动把前端切成深色而系统仍是浅色，
+ * 这时只看 media query 会得到「卡片浅色、面板深色」的割裂效果。
+ * 也正因为不能只靠 CSS 的 @media，主题是 JS 判定后用 class 落到根节点上的。
+ */
+function resolveDarkTheme(mode, hass, win) {
+  const m = String(mode === undefined || mode === null ? '' : mode).trim().toLowerCase();
+  if (m === 'dark' || m === 'night') return true;
+  if (m === 'light' || m === 'day') return false;
+  try {
+    if (hass && hass.themes && typeof hass.themes.darkMode === 'boolean') return hass.themes.darkMode;
+  } catch (e) { /* ignore */ }
+  try {
+    const w = win || (typeof window !== 'undefined' ? window : null);
+    if (w && typeof w.matchMedia === 'function') {
+      const q = w.matchMedia('(prefers-color-scheme: dark)');
+      if (q && typeof q.matches === 'boolean') return q.matches;
+    }
+  } catch (e) { /* ignore */ }
+  return false;
+}
+
+/**
+ * 实际下发到高德的底图样式。
+ * 夜间：配了 night_map_style 就用它；没配时只有白天还是默认 normal 才换成 darkblue ——
+ * 用户特意选了「草色青 / 马卡龙」这类自定义样式时不该被夜间主题悄悄吞掉。
+ */
+function effectiveMapStyle(cfg, dark) {
+  const day = String((cfg && cfg.map_style) || '').trim() || 'amap://styles/normal';
+  if (!dark) return day;
+  const night = String((cfg && cfg.night_map_style) || '').trim();
+  if (night) return night;
+  return day === 'amap://styles/normal' ? ALC_NIGHT_MAP_STYLE : day;
 }
 
 /** Haversine 距离（米） */
@@ -1161,6 +1208,8 @@ class CanvasFallbackMap {
     // 真实瓦片底图：JS API 完全不可用时（iOS App 内嵌 WKWebView 上常见）也不用看白板 ——
     // 直接按 Web 墨卡托取高德栅格瓦片画到 canvas 上，经纬度投影与 JS API 完全一致。
     this.tiles = opts.tiles !== false;
+    // 夜间：高德瓦片本身只有浅色版本，用 canvas 滤镜反色成暗色地图（见 _drawTiles）
+    this.dark = !!opts.dark;
     this._tileCache = new Map();
     this._tileRaf = null;
     this.markers = [];
@@ -1491,6 +1540,14 @@ class CanvasFallbackMap {
 
   /* ------------------------------------------------ 瓦片底图（无 JS API 时） */
 
+  /** 切换夜间模式：只重绘，不重建地图（视野、标记、弹窗都保留） */
+  setTheme(dark) {
+    const next = !!dark;
+    if (this.dark === next) return;
+    this.dark = next;
+    this._render();
+  }
+
   /**
    * 把高德栅格瓦片铺到 canvas 上。瓦片用的是标准 Web 墨卡托 XYZ 编号，
    * 与 project()/lonToWorldX() 的投影完全一致，所以标记不需要任何额外偏移。
@@ -1508,6 +1565,12 @@ class CanvasFallbackMap {
     const y0 = Math.floor(top / size);
     const x1 = Math.floor((left + w) / size);
     const y1 = Math.floor((top + h) / size);
+    // 夜间暗色地图：高德瓦片只有浅色版本。支持 ctx.filter 的浏览器直接反色
+    // （invert + hue-rotate 是暗色地图的经典配方：浅底变深底、深色文字变浅），
+    // 不支持的（老 Safari / 某些 WebView）退回半透明黑罩，至少不会刺眼。
+    const prevFilter = ctx.filter;
+    const canFilter = this.dark && typeof prevFilter === 'string';
+    if (canFilter) ctx.filter = 'invert(1) hue-rotate(180deg) brightness(.92) contrast(.92) saturate(.85)';
     let drawn = 0;
     for (let tx = x0; tx <= x1; tx++) {
       for (let ty = y0; ty <= y1; ty++) {
@@ -1518,6 +1581,15 @@ class CanvasFallbackMap {
         ctx.drawImage(img, tx * size - left, ty * size - top, size, size);
         drawn++;
       }
+    }
+    if (canFilter) {
+      ctx.filter = prevFilter;
+      // 反色后整体略偏亮，压一层很淡的暗色让点位更跳
+      ctx.fillStyle = 'rgba(10,14,20,0.16)';
+      ctx.fillRect(0, 0, w, h);
+    } else if (this.dark && drawn > 0) {
+      ctx.fillStyle = 'rgba(10,14,20,0.55)';
+      ctx.fillRect(0, 0, w, h);
     }
     return drawn > 0;
   }
@@ -1749,6 +1821,12 @@ class AmapLocationCard extends HTMLElement {
     if (cfg.view_mode !== 'locked') cfg.view_mode = 'follow';
     if (cfg.gesture !== 'scroll') cfg.gesture = 'map';
     if (cfg.click_action !== 'navigate') cfg.click_action = 'popup';
+    // 夜间主题：只认 auto / dark / light（night、day 等写法归一），拼错一律回自动
+    const themeRaw = String(cfg.theme === undefined || cfg.theme === null ? '' : cfg.theme).trim().toLowerCase();
+    cfg.theme = themeRaw === 'dark' || themeRaw === 'night' ? 'dark'
+      : themeRaw === 'light' || themeRaw === 'day' ? 'light' : 'auto';
+    cfg.night_map_style = String(cfg.night_map_style === undefined || cfg.night_map_style === null
+      ? '' : cfg.night_map_style).trim();
 
     // POI 分类码兜底。公共厕所尤其坑：v1.0.11 及更早把默认值写成了 140306，
     // 而高德官方分类里「公共设施;公共厕所」是 **200300**，140306 实测 count=0（永远搜不到）。
@@ -1786,6 +1864,8 @@ class AmapLocationCard extends HTMLElement {
     const first = !this._hass;
     this._hass = hass;
     if (!this._cfg) return;
+    // HA 里手动切深色/浅色时只有 hass 会变（视口不动、media query 也不动）
+    this._applyTheme();
     this._stateFromHass();
 
     // 首次渲染时若浏览器没有 WebGL / 未加载 JS API，等一帧再建图，避免容器尺寸为 0
@@ -1827,6 +1907,63 @@ class AmapLocationCard extends HTMLElement {
     if (this._gcj && headingChanged(prevHeading, res.heading)) this._renderPins();
     this._renderStatus();
     this._maybeUpdateMap();
+  }
+
+  /* --------------------------------------------------------- 夜间主题 */
+
+  /**
+   * 把主题落到三处：根节点 class（卡片配色）、高德底图样式、瓦片/简化视图。
+   * 只做真正的变化（`_darkTheme` 比对），hass 每秒刷好几次也不会反复 setMapStyle。
+   */
+  _applyTheme(force) {
+    if (!this._cfg || !this._els || !this._els.root) return;
+    const dark = resolveDarkTheme(this._cfg.theme, this._hass, typeof window !== 'undefined' ? window : null);
+    if (!force && this._darkTheme === dark) return;
+    this._darkTheme = dark;
+
+    const root = this._els.root;
+    // alc-dark / alc-light：地图侧（瓦片、简化视图网格）用
+    // alc-force-dark / alc-force-light：只有显式配置时才覆盖卡片 UI 变量 ——
+    //   auto 模式下不去动 HA 自己的主题变量，用户的自定义主题色才不会被吞掉
+    if (dark) { root.classList.add('alc-dark'); root.classList.remove('alc-light'); }
+    else { root.classList.add('alc-light'); root.classList.remove('alc-dark'); }
+    const mode = String(this._cfg.theme || 'auto').toLowerCase();
+    root.classList.remove('alc-force-dark', 'alc-force-light');
+    if (mode === 'dark' || mode === 'night') root.classList.add('alc-force-dark');
+    else if (mode === 'light' || mode === 'day') root.classList.add('alc-force-light');
+    try { root.setAttribute('data-alc-theme', dark ? 'dark' : 'light'); } catch (e) { /* ignore */ }
+
+    // 高德底图：换样式不重建地图，视野/标记都保留
+    if (this._mapMode === 'amap' && this._map && typeof this._map.setMapStyle === 'function') {
+      const style = effectiveMapStyle(this._cfg, dark);
+      if (this._mapStyleApplied !== style) {
+        try {
+          this._map.setMapStyle(style);
+          this._mapStyleApplied = style;
+        } catch (e) {
+          this._log(`切换底图样式失败：${(e && e.message) || e}`);
+        }
+      }
+    }
+    // 瓦片 / 简化视图：canvas 里自己画背景与网格，要把夜间标记传下去
+    if (this._fbMap && typeof this._fbMap.setTheme === 'function') this._fbMap.setTheme(dark);
+  }
+
+  /** 系统深浅色切换（浏览器/系统层变化，不一定伴随 hass 更新） */
+  _watchSystemTheme() {
+    if (this._onScheme || typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    this._onScheme = () => {
+      if (!this._cfg || String(this._cfg.theme || 'auto').toLowerCase() !== 'auto') return;
+      this._applyTheme();
+    };
+    try {
+      this._mq = window.matchMedia('(prefers-color-scheme: dark)');
+      if (this._mq && typeof this._mq.addEventListener === 'function') {
+        this._mq.addEventListener('change', this._onScheme);
+      } else if (this._mq && typeof this._mq.addListener === 'function') {
+        this._mq.addListener(this._onScheme);   // Safari < 14
+      }
+    } catch (e) { /* ignore */ }
   }
 
   /* ------------------------------------------------------- 生命周期 */
@@ -2014,7 +2151,9 @@ class AmapLocationCard extends HTMLElement {
 
     this._renderNotices();
     this._renderStatus();
-
+    // DOM 是刚重建的：夜间 class 与底图样式都要重新落一遍（force=true）
+    this._applyTheme(true);
+    this._watchSystemTheme();
     // 铺满模式：按「可视高度 − 上下工具栏」定高，并在容器顶栏/底栏挂载得比较晚时补算两次
     // （HA 的移动端底部导航、App 原生 tab bar 通常比卡片晚一两帧才出现）
     if (fill) {
@@ -2638,6 +2777,7 @@ class AmapLocationCard extends HTMLElement {
     this._els.gesture.style.touchAction = cfg.gesture === 'map' ? 'none' : 'pan-y';
     this._closeAmapPopup();
     this._markerIndex = new Map();   // 新地图实例：旧 Marker 已随旧图销毁，索引必须重建
+    this._mapStyleApplied = null;    // 新实例的样式由构造参数决定，_applyTheme 会补记
 
     try {
       // 交互全部由 .alc-gesture 手势层接管（用户输入根本到不了高德内部 DOM），
@@ -2649,7 +2789,7 @@ class AmapLocationCard extends HTMLElement {
         zoom: cfg.view_mode === 'locked' ? cfg.locked_zoom : cfg.follow_zoom,
         center,
         zooms: [3, 19],
-        mapStyle: cfg.map_style || 'amap://styles/normal',
+        mapStyle: effectiveMapStyle(cfg, this._darkTheme === true),
         resizeEnable: true,
         showLabel: true,
         rotateEnable: false,
@@ -2688,6 +2828,7 @@ class AmapLocationCard extends HTMLElement {
     }
 
     this._mapReady = false;
+    this._mapStyleApplied = effectiveMapStyle(this._cfg, this._darkTheme === true);
     this._map.on('complete', () => {
       this._mapReady = true;
       this._hideLoading();
@@ -3039,6 +3180,7 @@ class AmapLocationCard extends HTMLElement {
       focusLng: this._gcj ? this._gcj.lng : null,
       focusLat: this._gcj ? this._gcj.lat : null,
       radius: this._cfg.show_radius_circle ? this._currentRadius() : 0,
+      dark: this._darkTheme === true,   // 夜间：瓦片走暗色滤镜 / 网格与背景换深色
       onMarkerClick: (data) => this._onPinClick(data),
       onBlankTap: () => this._closeAmapPopup(),
       onViewChange: () => { this._userPannedAt = Date.now(); this._renderStatus(); this._onViewportChanged(); },
@@ -3100,6 +3242,7 @@ class AmapLocationCard extends HTMLElement {
     this._pins = [];
     this._mapReady = false;
     this._mapMode = null;
+    this._mapStyleApplied = null;
     if (this._els && this._els.mapEl) this._els.mapEl.innerHTML = '';
   }
 
@@ -3142,6 +3285,14 @@ class AmapLocationCard extends HTMLElement {
       this._onViewportResize = null;
     }
     if (this._onClick && this._shadow) { this._shadow.removeEventListener('click', this._onClick); this._onClick = null; }
+    if (this._onScheme) {
+      try {
+        if (this._mq && typeof this._mq.removeEventListener === 'function') this._mq.removeEventListener('change', this._onScheme);
+        else if (this._mq && typeof this._mq.removeListener === 'function') this._mq.removeListener(this._onScheme);
+      } catch (e) { /* ignore */ }
+      this._onScheme = null;
+      this._mq = null;
+    }
     if (this._onOnline) {
       try { window.removeEventListener('online', this._onOnline); } catch (e) { /* ignore */ }
       this._onOnline = null;
@@ -4033,6 +4184,19 @@ const ALC_EDITOR_SECTIONS = [
   {
     title: '图标与外观', open: false,
     fields: [
+      { key: 'theme', label: '夜间主题', type: 'select', options: [
+        ['auto', '自动 · 跟随 HA 主题 / 系统'],
+        ['light', '始终浅色（白天）'],
+        ['dark', '始终夜间'],
+      ], hint: '自动：优先跟随 HA 的深色模式（你在 HA 里手动切深色也认），取不到再看系统设置。夜间时底图会换成暗色样式，瓦片底图自动反色，卡片配色一并转深；白天则是纯浅色' },
+      { key: 'night_map_style', label: '夜间底图样式', type: 'select', options: [
+        ['', '自动（默认样式 → 幻影黑；自定义样式则沿用）'],
+        ['amap://styles/darkblue', '幻影黑（推荐）'],
+        ['amap://styles/dark', '暗夜'],
+        ['amap://styles/blue', '极夜蓝'],
+        ['amap://styles/grey', '雅士灰'],
+        ['amap://styles/normal', '不换样式（始终用上面的地图样式）'],
+      ], hint: '只在夜间生效。留空 = 白天还是「标准」才换暗色，你若选了草色青/马卡龙这类自定义样式则不被覆盖；填了则夜间一律用它' },
       { key: 'icon_entity', label: '实体图标', type: 'text', hint: '支持 mdi:crosshairs-gps、图片 URL、/local/xxx.png 或 emoji' },
       { key: 'icon_charging', label: '充电桩图标', type: 'text', hint: '默认 mdi:ev-station' },
       { key: 'icon_toilet', label: '公共厕所图标', type: 'text', hint: '默认 mdi:human-male-female' },
@@ -4374,7 +4538,42 @@ class AmapLocationCardEditor extends HTMLElement {
 const ALC_STYLES = `
 :host { display:block; }
 ha-card { overflow:hidden; }
-.alc-root { --alc-radius: var(--ha-card-border-radius, 12px); position:relative; }
+/* 地图侧配色变量放在根节点：简化视图 / 瓦片底图从这里继承。
+   主题是 JS 判定的（HA 主题优先于系统），所以不用 @media —— 用户在 HA 里
+   手动切深色而系统是浅色时，@media 会给错结果。详见 resolveDarkTheme()。 */
+.alc-root { --alc-radius: var(--ha-card-border-radius, 12px); position:relative;
+  --alc-fallback-bg:#eef2f6; --alc-fallback-grid:rgba(0,0,0,.07); --alc-accent:#03a9f4; }
+
+/* 夜间（auto 跟随 / 显式 dark 都加这个 class）：只改地图侧，卡片 UI 仍用 HA 变量 */
+.alc-root.alc-dark { --alc-fallback-bg:#15191f; --alc-fallback-grid:rgba(255,255,255,.09);
+  --alc-accent:#4fc3f7; }
+.alc-root.alc-dark .alc-pin { background:#262c35; border-color:#262c35; }
+.alc-root.alc-dark .alc-pin-entity { border-color:#ef5350; }
+.alc-root.alc-dark .alc-pin-charging { border-color:#26c281; }
+.alc-root.alc-dark .alc-pin-toilet { border-color:#9575cd; }
+.alc-root.alc-dark .alc-status { background:rgba(22,26,32,.78); }
+.alc-root.alc-dark .alc-notice, .alc-root.alc-dark .alc-pop,
+.alc-root.alc-dark .alc-fm-btn, .alc-root.alc-dark .alc-fm-badge,
+.alc-root.alc-dark .alc-popup-close { background:#1f242c; }
+
+/* 显式 theme: dark / light 时才强制覆盖卡片 UI 变量。
+   auto 模式不动它们 —— 用户的自定义 HA 主题（米色、护眼绿…）不该被卡片吞掉。 */
+.alc-root.alc-force-dark {
+  --card-background-color:#1c2027;
+  --primary-text-color:#e8eaed;
+  --secondary-text-color:#9aa3ae;
+  --divider-color:rgba(255,255,255,.14);
+  --secondary-background-color:rgba(255,255,255,.06);
+  --alc-fallback-bg:#15191f; --alc-fallback-grid:rgba(255,255,255,.09); --alc-accent:#4fc3f7;
+}
+.alc-root.alc-force-light {
+  --card-background-color:#fff;
+  --primary-text-color:#1a1c1f;
+  --secondary-text-color:#5f6670;
+  --divider-color:rgba(0,0,0,.12);
+  --secondary-background-color:#f2f4f7;
+  --alc-fallback-bg:#eef2f6; --alc-fallback-grid:rgba(0,0,0,.07); --alc-accent:#03a9f4;
+}
 
 /* overflow:hidden —— 标记/弹窗一律裁剪在地图框内，绝不溢出到页面上 */
 .alc-map-wrap { position:relative; overflow:hidden; background:var(--secondary-background-color, #e9edf2); }
@@ -4536,9 +4735,8 @@ ha-card { overflow:hidden; }
 
 /* 高德底图模式弃用 InfoWindow（Shadow DOM 下收不到点击），改用自绘弹窗 .alc-amap-pop */
 
-/* 简化视图 */
-.alc-fallback-map { --alc-fallback-bg:#eef2f6; --alc-fallback-grid:rgba(0,0,0,.07); --alc-accent:#03a9f4;
-  position:absolute; inset:0; overflow:hidden; background:var(--alc-fallback-bg); cursor:grab; }
+/* 简化视图（颜色全部继承自 .alc-root 的 --alc-* 变量，夜间由 .alc-dark 覆盖） */
+.alc-fallback-map { position:absolute; inset:0; overflow:hidden; background:var(--alc-fallback-bg); cursor:grab; }
 .alc-fallback-map:active { cursor:grabbing; }
 .alc-fm-canvas { position:absolute; inset:0; display:block; }
 .alc-fm-layer { position:absolute; inset:0; overflow:hidden; }
@@ -4561,10 +4759,6 @@ ha-card { overflow:hidden; }
 /* iOS 触摸优化 */
 .alc-root button { touch-action:manipulation; }
 .alc-map, .alc-fallback-map { -webkit-user-select:none; user-select:none; }
-
-@media (prefers-color-scheme: dark) {
-  .alc-fallback-map { --alc-fallback-bg:#1b1e23; --alc-fallback-grid:rgba(255,255,255,.08); }
-}
 `;
 
 const ALC_EDITOR_STYLES = `
