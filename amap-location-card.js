@@ -38,6 +38,9 @@ const ALC_DEFAULTS = {
   entity: '',
   title: '',
   height: 320,
+  /* 铺满浏览器窗口：地图自动撑满可视区域（配置编辑器里的预览不铺满）。
+     关掉后回到固定高度 height。 */
+  fill_viewport: true,
 
   /* 高德 Key —— 只需要一个：同一个 Key 同时用于坐标转换、周边检索与地图底图 */
   amap_key: '',
@@ -1403,6 +1406,7 @@ class AmapLocationCard extends HTMLElement {
     this._map = null;
     this._fbMap = null;
     this._markers = [];
+    this._markerIndex = new Map();   // 高德 Marker 复用索引（拖动重搜时增量更新，见 _renderPins）
     this._pins = [];
     this._notices = new Map();
     this._poiGroups = [];
@@ -1438,6 +1442,7 @@ class AmapLocationCard extends HTMLElement {
 
     const cfg = Object.assign({}, ALC_DEFAULTS, config);
     cfg.height = clamp(toNum(cfg.height) || 320, 120, 1200);
+    cfg.fill_viewport = cfg.fill_viewport !== false;   // 默认 true，显式 false 才关
     cfg.radius = clamp(toNum(cfg.radius) || 2000, 50, 50000);
     cfg.auto_radius_pad = clamp(toNum(cfg.auto_radius_pad) || 1, 0.2, 4);
     cfg.auto_radius_max = clamp(toNum(cfg.auto_radius_max) || 5000, 100, 50000);
@@ -1523,17 +1528,41 @@ class AmapLocationCard extends HTMLElement {
   }
 
   getCardSize() {
+    if (this._cfg && this._cfg.fill_viewport && !this._inEditorPreview()) {
+      const vh = (typeof window !== 'undefined' && window.innerHeight) || 800;
+      return Math.max(6, Math.round(vh / 50));
+    }
     const h = (this._cfg && this._cfg.height) || 320;
     return Math.max(4, Math.round(h / 50) + 3);
+  }
+
+  /** 是否处在 HA 的卡片配置编辑器预览里 —— 那里不铺满，避免把配置面板撑爆 */
+  _inEditorPreview() {
+    try {
+      let node = this;
+      for (let i = 0; i < 24 && node; i++) {
+        const tag = (node.tagName || '').toLowerCase();
+        const cls = typeof node.className === 'string' ? node.className : '';
+        // HA 各版本的配置容器：卡片预览 / 元素编辑器 / 选项表单 / 编辑弹窗
+        if (/^hui-(card-preview|card-element-editor|card-options|dialog-edit-card)/.test(tag)) return true;
+        if (tag === 'ha-dialog' || tag === 'ha-dialog-header') return true;
+        if (/(^|[\s-])(card-config|card-options|element-editor)([\s-]|$)/.test(cls)) return true;
+        const root = node.getRootNode ? node.getRootNode() : null;
+        node = node.parentElement || (root && root.host) || null;
+      }
+    } catch (e) { /* ignore */ }
+    return false;
   }
 
   /* --------------------------------------------------------- DOM 骨架 */
 
   _build() {
     const cfg = this._cfg;
+    const fill = !!cfg.fill_viewport && !this._inEditorPreview();
+    this._fillViewport = fill;
     this._shadow.innerHTML = `
       <style>${ALC_STYLES}</style>
-      <ha-card class="alc-root">
+      <ha-card class="alc-root${fill ? ' alc-fill' : ''}">
         <div class="alc-head">
           <div class="alc-head-main">
             <div class="alc-title"></div>
@@ -1541,7 +1570,7 @@ class AmapLocationCard extends HTMLElement {
           </div>
           <div class="alc-chips"></div>
         </div>
-        <div class="alc-map-wrap" style="height:${cfg.height}px">
+        <div class="alc-map-wrap"${fill ? '' : ` style="height:${cfg.height}px"`}>
           <div class="alc-map" id="alc-map"></div>
           <div class="alc-gesture" id="alc-gesture"></div>
           <div class="alc-amap-ctrl" id="alc-amap-ctrl" hidden>
@@ -1960,6 +1989,7 @@ class AmapLocationCard extends HTMLElement {
     // 手势事件由卡片的 .alc-gesture 层接管，这里按手势策略设置它的 touch-action
     this._els.gesture.style.touchAction = cfg.gesture === 'map' ? 'none' : 'pan-y';
     this._closeAmapPopup();
+    this._markerIndex = new Map();   // 新地图实例：旧 Marker 已随旧图销毁，索引必须重建
 
     try {
       // 交互全部由 .alc-gesture 手势层接管（用户输入根本到不了高德内部 DOM），
@@ -2462,7 +2492,8 @@ class AmapLocationCard extends HTMLElement {
       return;
     }
 
-    this._showLoading('正在检索周边设施…');
+    // 检索全程不显示任何 loading / 遮罩：拖动、缩放触发的重检索要「无感」，
+    // 旧数据一直留在图上，新结果回来再原地更新（见 _renderPins 的增量重建）。
     const center = this._searchCenter();    // auto：视野中心（拖动后跟随新视野）；fixed：实体
     const radius = this._currentRadius();   // auto 模式下跟随地图可视范围
     const errors = [];
@@ -2490,7 +2521,6 @@ class AmapLocationCard extends HTMLElement {
     this._lastRadius = radius;
     this._lastCenter = { lng: center.lng, lat: center.lat };
     this._syncRadiusCircle(radius);
-    this._hideLoading();
 
     if (errors.length) {
       this._showNotice('poi', 'warn', errors.join('；'), '重试', () => this._refresh(true));
@@ -2498,14 +2528,8 @@ class AmapLocationCard extends HTMLElement {
       this._notices.delete('poi');
     }
 
-    const total = groups.reduce((n, g) => n + g.items.length, 0);
-    if (!errors.length && total === 0) {
-      const names = defs.map((d) => d.label).join(' / ');
-      const how = cfg.radius_mode === 'auto' ? '把地图缩小一点可自动扩大检索范围' : '可尝试调大搜索半径';
-      this._showNotice('poi-empty', 'info', `半径 ${radius} 米内未找到${names}。${how}。`);
-    } else {
-      this._notices.delete('poi-empty');
-    }
+    // 搜不到时保持安静：不弹提示条、不改标题，地图上只留实体点（用户明确要求）
+    this._notices.delete('poi-empty');
 
     this._renderHeader();
     this._renderPins();
@@ -2531,6 +2555,7 @@ class AmapLocationCard extends HTMLElement {
     this._pins = [];
     if (this._map) { try { this._map.remove(this._markers); } catch (e) { /* ignore */ } }
     this._markers = [];
+    this._markerIndex = new Map();
     if (this._fbMap) this._fbMap.setMarkers([]);
     if (this._notices) this._notices.delete('offscreen');
     this._activePinData = null;
@@ -2575,21 +2600,38 @@ class AmapLocationCard extends HTMLElement {
     // 此时不能假定 window.AMap 还在，否则一次刷新就整卡抛错。
     const AMap = (typeof window !== 'undefined') ? window.AMap : null;
     if (this._map && AMap && typeof AMap.Marker === 'function') {
-      try { this._map.remove(this._markers); } catch (e) { /* ignore */ }
-      this._markers = [];
+      /* 增量更新：同一个 POI 复用已有 Marker，只补新增、删消失的。
+         整批 remove + add 会让标记整体闪一下 —— 拖动后的自动重检索就「跳」，
+         所以这里按 key 做 diff，让拖动重搜真正无感。 */
+      const prev = (this._markerIndex instanceof Map) ? this._markerIndex : new Map();
+      const next = new Map();
+      const added = [];
       pins.forEach((p) => {
-        const marker = new AMap.Marker({
-          position: [p.lng, p.lat],
-          content: this._pinHtml(p.icon, p.size, p.kind),
-          offset: new AMap.Pixel(-p.size / 2, -p.size / 2),
-          zIndex: p.kind === 'entity' ? 200 : 100,
-          clickable: true,
-          extData: p,
-        });
-        marker.on('click', () => { /* 点击由手势层命中处理（见 _amapTap） */ });
-        this._markers.push(marker);
+        const poiId = (p.data && p.data.item && p.data.item.poi && p.data.item.poi.id) || `${p.lng},${p.lat}`;
+        const key = p.kind === 'entity' ? 'entity' : `${p.kind}:${poiId}`;
+        let marker = prev.get(key);
+        if (marker) {
+          prev.delete(key);
+          try { marker.setPosition([p.lng, p.lat]); } catch (e) { /* ignore */ }
+        } else {
+          marker = new AMap.Marker({
+            position: [p.lng, p.lat],
+            content: this._pinHtml(p.icon, p.size, p.kind),
+            offset: new AMap.Pixel(-p.size / 2, -p.size / 2),
+            zIndex: p.kind === 'entity' ? 200 : 100,
+            clickable: true,
+            extData: p,
+          });
+          marker.on('click', () => { /* 点击由手势层命中处理（见 _amapTap） */ });
+          added.push(marker);
+        }
+        next.set(key, marker);
       });
-      if (this._markers.length) this._map.add(this._markers);
+      const removed = Array.from(prev.values());
+      if (removed.length) { try { this._map.remove(removed); } catch (e) { /* ignore */ } }
+      if (added.length) this._map.add(added);
+      this._markerIndex = next;
+      this._markers = Array.from(next.values());
     }
 
     if (this._fbMap) {
@@ -2970,7 +3012,8 @@ const ALC_EDITOR_SECTIONS = [
         ['gcj02', 'GCJ-02 / 高德坐标（不纠偏，直接用）'],
       ], hint: '坐标来自 GPS 模块、HA Companion App 等 → 选 WGS-84；来自高德/腾讯等国内 App 上报（本身已是高德坐标）→ 必须选 GCJ-02，否则所有点会在高德底图上整体偏移约 300~600 米' },
       { key: 'title', label: '卡片标题', type: 'text', hint: '留空则显示实体名称' },
-      { key: 'height', label: '地图高度（px）', type: 'number', min: 120, max: 1200 },
+      { key: 'height', label: '地图高度（px）', type: 'number', min: 120, max: 1200, dependsOn: { fill_viewport: false }, hint: '仅在关闭「铺满窗口」时生效' },
+      { key: 'fill_viewport', label: '铺满浏览器窗口', type: 'boolean', hint: '开：地图自动撑满可视区域高度（配置编辑器的预览不会铺满）；关：使用上面的固定高度' },
       { key: 'view_mode', label: '视图模式', type: 'select', options: [['follow', '自动跟随实体居中'], ['locked', '手动锁定视图']] },
       { key: 'follow_zoom', label: '跟随缩放级别', type: 'number', min: 3, max: 19, dependsOn: { view_mode: 'follow' } },
       { key: 'locked_center', label: '锁定中心（经度,纬度）', type: 'text', dependsOn: { view_mode: 'locked' }, placeholder: '116.397428,39.90923' },
@@ -3056,12 +3099,19 @@ class AmapLocationCardEditor extends HTMLElement {
     this._hass = null;
     this._built = false;
     this._pendingUpgrade = false;
+    this._upgradeSig = null;      // 已处理过的能力签名（见 _ensureUpgrade）
+    this._upgradeWait = 2500;     // 等原生控件注册的上限；测试会调小
+    this._blurHooked = false;
   }
 
   set hass(hass) {
     this._hass = hass;
     if (!this._built) this._build();
-    else this._applyHass();
+    else {
+      this._applyHass();
+      // 原生控件可能比卡片晚注册：hass 是天然的心跳，顺手复查一次（同签名立即返回，无副作用）
+      this._ensureUpgrade();
+    }
   }
   get hass() { return this._hass; }
 
@@ -3077,23 +3127,63 @@ class AmapLocationCardEditor extends HTMLElement {
 
   _has(tag) { return typeof customElements !== 'undefined' && !!customElements.get(tag); }
 
+  /** 组件能力签名：ha-textfield / ha-entity-picker 是否已注册（11 = 都齐了） */
+  _capSig() {
+    return `${this._has('ha-textfield') ? 1 : 0}${this._has('ha-entity-picker') ? 1 : 0}`;
+  }
+
+  /** 焦点是否停在编辑器内部：重建 DOM 会打断输入，此时必须推迟 */
+  _focusInside() {
+    const ae = this._shadow && this._shadow.activeElement;
+    return !!(ae && ae !== this._shadow);
+  }
+
+  /**
+   * HA 的原生控件是按需注册的：刚打开配置面板时 ha-textfield / ha-entity-picker
+   * 可能还没定义，只能用原生 input/select 顶上；等组件到位后再升级成原生控件。
+   *
+   * ⚠️ 这里踩过一个致命坑（2026-10-18 用户反馈「配置时页面定时重置」）：
+   * 旧实现是「只要 textfield 或 entity-picker 任一存在 → 重建」，
+   * 而 HA 里 ha-textfield 必然存在、ha-entity-picker 往往迟迟不注册，
+   * 于是 _build() → _ensureUpgrade() → 2.5s 后重建 → 再 _ensureUpgrade() …… 无限循环，
+   * 表现就是配置面板每 2.5 秒整体重建一次：输入框失焦、滚动条回到顶部、值被回填，
+   * 根本没法改配置。
+   *
+   * 现在的规则：**按能力签名决定**——同一档能力只重建一次，只有「能力真的变多」才重建；
+   * 正在输入时一律推迟到失焦。
+   */
   _ensureUpgrade() {
     if (this._pendingUpgrade) return;
-    if (this._has('ha-entity-picker') && this._has('ha-textfield')) return;
+    const sig = this._capSig();
+    if (sig === this._upgradeSig) return;       // 这一档已经处理过，绝不再重建
+    if (this._focusInside()) { this._retryUpgradeOnBlur(); return; }
+
     this._pendingUpgrade = true;
+    this._upgradeSig = sig;                     // 先记账：保证同一档最多重建一次
     Promise.race([
       Promise.all([
         customElements.whenDefined('ha-entity-picker').catch(() => {}),
         customElements.whenDefined('ha-textfield').catch(() => {}),
       ]),
-      sleep(2500),
+      sleep(this._upgradeWait || 2500),
     ]).then(() => {
       this._pendingUpgrade = false;
-      if (this._has('ha-entity-picker') || this._has('ha-textfield')) {
-        this._built = false;
-        this._build();
-      }
+      if (this._capSig() === sig) return;       // 能力没变 → 保持现有控件，不再重建
+      if (this._focusInside()) { this._retryUpgradeOnBlur(); return; }
+      this._built = false;
+      this._build();
     });
+  }
+
+  /** 等用户离开输入框再升级控件（否则会打断正在输入的内容） */
+  _retryUpgradeOnBlur() {
+    if (this._blurHooked || !this._shadow) return;
+    this._blurHooked = true;
+    this._shadow.addEventListener('focusout', () => {
+      this._blurHooked = false;
+      // 留一拍：焦点可能只在相邻字段之间跳，别把它当成失焦
+      setTimeout(() => { if (!this._focusInside()) this._ensureUpgrade(); }, 0);
+    }, { once: true });
   }
 
   _fieldVisible(field) {
@@ -3285,8 +3375,15 @@ class AmapLocationCardEditor extends HTMLElement {
       const value = this._config[key];
       const ctrl = row.querySelector('ha-switch, ha-textfield, ha-entity-picker, input, select');
       if (!ctrl) return;
-      if (def.type === 'boolean') ctrl.checked = !!value;
-      else if (ctrl.value !== undefined) ctrl.value = value === undefined || value === null ? '' : String(value);
+      if (def.type === 'boolean') {
+        if (!!ctrl.checked !== !!value) ctrl.checked = !!value;
+        return;
+      }
+      if (ctrl.value === undefined) return;
+      // 值没变就不要赋值：给 input / ha-textfield 赋同值也会把光标推到末尾，
+      // 用户正在输入时看起来就是「打到一半被重置」（配置页体验事故）
+      const next = value === undefined || value === null ? '' : String(value);
+      if (String(ctrl.value) !== next) ctrl.value = next;
     });
     this._applyHass();
   }
@@ -3310,6 +3407,12 @@ ha-card { overflow:hidden; }
 
 /* overflow:hidden —— 标记/弹窗一律裁剪在地图框内，绝不溢出到工具栏或页面上 */
 .alc-map-wrap { position:relative; overflow:hidden; background:var(--secondary-background-color, #e9edf2); }
+
+/* 铺满窗口：卡片撑满视口高度，地图吃掉除头/工具栏外的剩余空间。
+   HA 配置编辑器里的预览不加 .alc-fill（见 _inEditorPreview），保持原高度不撑爆面板。 */
+.alc-root.alc-fill { display:flex; flex-direction:column; height:100vh; height:100dvh; }
+.alc-root.alc-fill .alc-map-wrap { flex:1 1 auto; min-height:160px; }
+.alc-root.alc-fill .alc-list { max-height:45vh; }
 /* z-index:0 让 .alc-map 自成叠加上下文，把高德内部的标记/Logo/iframe 全部压在本卡片的
    手势层（z10）之下 —— 交互统一走手势层，不被高德内部 DOM 拦截 */
 .alc-map { position:absolute; inset:0; z-index:0; }
