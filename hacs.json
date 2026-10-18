@@ -1,6 +1,6 @@
 {
   "name": "高德探路卡 · AMap Scout",
-  "filename": "ha-amap-scout.js",
+  "filename": "amap-location-card.js",
   "content_in_root": true,
   "render_readme": true
 }

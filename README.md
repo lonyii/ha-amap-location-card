@@ -13,7 +13,7 @@
 
 - [功能特性](#功能特性)
 - [安装](#安装)
-- [命名与迁移（v1.1.0 改名）](#命名与迁移v110-改名)
+- [命名与迁移（v1.1.1）](#命名与迁移v111)
 - [高德 Key 申请](#高德-key-申请很重要)
 - [快速开始](#快速开始)
 - [完整配置项](#完整配置项)
@@ -65,15 +65,24 @@
 3. 搜索 `高德探路卡`（或 `AMap Scout`）→ 下载
 4. 刷新浏览器（清缓存）
 
-> 仓库根目录需包含 `hacs.json`、`package.json` 与 `ha-amap-scout.js`，本仓库已经具备。
+> 仓库根目录需包含 `hacs.json`、`package.json`、`amap-location-card.js`（实现）与
+> `ha-amap-scout.js`（新路径转发入口），本仓库已经具备。
 
 ### 方式二：手动安装
 
-1. 把 `ha-amap-scout.js` 复制到 HA 配置目录的 `config/www/` 下（若无 `www` 目录请新建）
-2. 设置 → 仪表盘 → 右上角 ⋮ → **资源** → 添加资源
-   - URL：`/local/ha-amap-scout.js`
-   - 类型：**JavaScript 模块**
-3. 刷新浏览器
+把**两个文件都**复制到 HA 配置目录的 `config/www/` 下（若无 `www` 目录请新建）：
+
+```
+config/www/amap-location-card.js   ← 实现（单文件，真正干活的就是它）
+config/www/ha-amap-scout.js        ← 新路径入口，只有一行 import
+```
+
+然后 设置 → 仪表盘 → 右上角 ⋮ → **资源** → 添加资源，URL 填下面**任意一个**都行：
+
+| 填这个 | 说明 |
+| --- | --- |
+| `/local/ha-amap-scout.js` | 推荐，名字跟项目一致（**类型必须选「JavaScript 模块」**，它是 ESM 转发） |
+| `/local/amap-location-card.js` | 历史路径，v1.0.x 升上来的老配置不用改（模块 / JavaScript 都能跑） |
 
 ### 方式三：快速试用（不写资源）
 
@@ -87,7 +96,7 @@ resources:
 
 ---
 
-## 命名与迁移（v1.1.0 改名）
+## 命名与迁移（v1.1.1）
 
 这张卡片叫 **高德探路卡（AMap Scout）**。`scout` 是侦察兵 / 探路者 —— **以实体为据点向外侦察周边设施，
 再带你去那儿**，正好说清它和一堆「通用高德地图卡片」的区别（生态里 `amap-card`、`cn-map-card`、
@@ -95,19 +104,36 @@ resources:
 
 | 位置 | 值 |
 | --- | --- |
-| GitHub 仓库 | `lonyii/ha-amap-scout` |
-| 主文件 | `ha-amap-scout.js` |
+| GitHub 仓库 | `lonyii/ha-amap-scout-card` |
+| 实现文件 | `amap-location-card.js`（历史文件名，**故意不改**，见下） |
+| 新路径入口 | `ha-amap-scout.js`（一行 import，转发到实现） |
 | 卡片类型 | `custom:amap-scout` |
 | 卡片选择器显示名 | 高德探路 · AMap Scout |
 
-**从 v1.0.x 升级，YAML 一行都不用改**：
+### 为什么实现文件还叫 `amap-location-card.js`
 
-- 旧卡片类型 `custom:amap-location-card` **仍然注册**（内部是同一实现的子类别名），
-  老 dashboard、老编辑器都能继续用；编辑器也不会把你写的旧 type 悄悄换成新的；
-- 只有**资源文件路径**变了（`/local/amap-location-card.js` → `/local/ha-amap-scout.js`）：
-  在「设置 → 仪表盘 → 资源」里把 URL 改掉，或删掉旧的、按上面 [安装](#安装) 重新加一条；
-- 旧的 `amap-location-card.js` 可以删除，避免同一页面加载两份。HACS 自定义仓库的地址若还是旧名，
-  GitHub 会 301 到新仓库，但建议顺手在 HACS 里更新一下，免得以后取不到 release。
+HA 的资源 URL 是**用户自己配的**，改文件名 = 所有老安装立刻报
+`Custom element doesn't exist: amap-scout`（v1.1.0 就是这么踩的坑）。
+
+所以现在的做法是：**实现留在老路径，新路径放一个转发模块**，两个 URL 都有效：
+
+```js
+// ha-amap-scout.js 的全部内容
+import './amap-location-card.js';
+```
+
+代价只是文件名不如项目名漂亮，换来的是**升级永远不用动资源路径**。
+
+### 从 v1.0.x 升级要做什么
+
+| 你的情况 | 要做的事 |
+| --- | --- |
+| 资源填的是 `/local/amap-location-card.js` | **什么都不用改**，覆盖同名文件即可；`type` 用 `custom:amap-location-card` 或 `custom:amap-scout` 都能跑 |
+| 资源填的是 `/local/ha-amap-scout.js` | 确保同目录也有 `amap-location-card.js`（少了就报 `Custom element doesn't exist`） |
+| 用 HACS 安装 | 更新后 HACS 仍指向 `/hacsfiles/.../amap-location-card.js`，无需改资源 |
+
+卡片 `type` 的兼容规则：旧的 `custom:amap-location-card` **仍然注册**（内部是同一实现的子类别名），
+编辑器也不会把你写的旧 type 悄悄改成新的。想用新名字就写 `custom:amap-scout`。
 
 ---
 
@@ -634,7 +660,7 @@ JS API：v2.0 · https://webapi.amap.com/maps
 
 | 现象 | 可能原因与处理 |
 | --- | --- |
-| **升级到 v1.1.0 后卡片报「Custom element doesn't exist: amap-scout」** | 只是**资源路径**没换：主文件已从 `amap-location-card.js` 改名为 `ha-amap-scout.js`，去「设置 → 仪表盘 → 资源」把 URL 改成 `/local/ha-amap-scout.js`（或删掉旧的重新加）。卡片 `type` 不用改 —— 旧的 `custom:amap-location-card` 仍然注册 |
+| **卡片报「Custom element doesn't exist: amap-scout」** | 说明页面上跑的还是 v1.0.x 的旧文件（旧版只注册 `amap-location-card`），或者资源 URL 指向的文件不存在。①先确认 `config/www/` 里有新版 `amap-location-card.js`（并清缓存）；②若资源填的是 `/local/ha-amap-scout.js`，同目录必须也有 `amap-location-card.js`（新路径只是个转发入口）。v1.1.1 起老路径不用改，覆盖同名文件即可 |
 | 提示「高德 Key 无效或未开通该服务」 | Key 填错或不支持 Web 服务，请在控制台确认该 Key 的可用服务 |
 | 提示「缺少安全密钥」/ `INVALID_USER_SCODE` | 底图需要：填 `security_js_code`（控制台「Key 详情」里的安全密钥） |
 | 底图不出但点位正常 | 说明该 Key 不是「Web 端（JS API）」类型，或底图脚本被拦截 → 卡片已降级为简化视图，**看提示条里的具体原因**，详见 [底图加载不出来](#底图加载不出来先看提示条说了什么) |
@@ -721,7 +747,7 @@ JS API：v2.0 · https://webapi.amap.com/maps
 
 ```bash
 # 语法检查（CI 里跑的就是这一句）
-node --check ha-amap-scout.js
+node --check amap-location-card.js
 ```
 
 完整测试脚本（`.smoke-test.cjs` / `.dom-test.cjs` / `.demo-check.cjs` / `.geo-audit.cjs`）
@@ -753,15 +779,16 @@ node .geo-audit.cjs    # 几何审计：自动半径内切 / 外接、结果是�
 Windows 上直接 **双击 `push.cmd`** 也行（自动定位 Git Bash，跑完停住让你看结果）。
 `.cmd` 必须用 CRLF 换行，`.gitattributes` 已固定该规则，`push.sh` 每次运行也会自动纠正。
 
-发布白名单：`ha-amap-scout.js`、`README.md`、`hacs.json`、`package.json`、
+发布白名单：`amap-location-card.js`、`ha-amap-scout.js`、`README.md`、`hacs.json`、`package.json`、
 `.gitignore`、`.github/`。`demo.html` 与测试脚本被 `.gitignore` 挡在仓库外
 （demo 内含本地 Key，绝不外发）。
 
 ### 目录结构
 
 ```
-ha-amap-scout/                # GitHub 仓库（只含发布文件）
-├── ha-amap-scout.js          # 卡片本体（唯一交付物，单文件免构建）
+ha-amap-scout-card/           # GitHub 仓库（只含发布文件）
+├── amap-location-card.js     # 卡片本体（唯一实现，单文件免构建）
+├── ha-amap-scout.js          # 新路径入口：一行 import 转发到上面那个（老路径继续可用）
 ├── hacs.json                 # HACS 元数据
 ├── package.json
 ├── README.md
