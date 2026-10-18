@@ -16,7 +16,7 @@
  *   · iPhone Safari：touch-action 手势治理、固定 px 高度、WebGL 探测、点击兜底
  * ============================================================================= */
 
-const ALC_VERSION = '1.0.2';
+const ALC_VERSION = '1.0.3';
 const ALC_CARD_TAG = 'amap-location-card';
 const ALC_EDITOR_TAG = 'amap-location-card-editor';
 
@@ -1587,7 +1587,8 @@ class AmapLocationCard extends HTMLElement {
   getCardSize() {
     if (this._cfg && this._cfg.fill_viewport && !this._inEditorPreview()) {
       const vh = (typeof window !== 'undefined' && window.innerHeight) || 800;
-      return Math.max(6, Math.round(vh / 50));
+      // 减掉已测到的底部工具栏高度，masonry 预留的高度才不会把列表挤到屏幕外
+      return Math.max(6, Math.round((vh - (this._fillGap || 0)) / 50));
     }
     const h = (this._cfg && this._cfg.height) || 320;
     return Math.max(4, Math.round(h / 50) + 3);
@@ -1724,13 +1725,120 @@ class AmapLocationCard extends HTMLElement {
 
     this._renderNotices();
     this._renderStatus();
+
+    // 铺满模式：按「可视高度 − 上下工具栏」定高，并在容器顶栏/底栏挂载得比较晚时补算两次
+    // （HA 的移动端底部导航、App 原生 tab bar 通常比卡片晚一两帧才出现）
+    if (fill) {
+      this._syncFillHeight();
+      requestAnimationFrame(() => { if (this._cfg) this._resizeMap(); });
+      clearTimeout(this._fillTimer1);
+      clearTimeout(this._fillTimer2);
+      this._fillTimer1 = setTimeout(() => { if (this._cfg && this._fillViewport) this._resizeMap(); }, 350);
+      this._fillTimer2 = setTimeout(() => { if (this._cfg && this._fillViewport) this._resizeMap(); }, 1200);
+
+      if (!this._onViewportResize) {
+        this._onViewportResize = () => this._scheduleFillSync();
+        try {
+          window.addEventListener('resize', this._onViewportResize);
+          window.addEventListener('orientationchange', this._onViewportResize);
+          if (window.visualViewport) window.visualViewport.addEventListener('resize', this._onViewportResize);
+        } catch (e) { /* ignore */ }
+      }
+    }
   }
 
   refresh() { this._refresh(true); }
 
+  /* --------------------------------------- 铺满高度：扣掉容器上下工具栏 */
+
+  /**
+   * 铺满模式的实际高度 = 可视高度 − 上方占位 − 下方遮挡。
+   *
+   * 为什么不能只用 CSS 的 `100dvh`：dvh 只知道浏览器自己的地址栏/工具栏，
+   * 容器自己的顶栏（HA 顶栏、侧边栏头部）和底栏（HA 移动端底部导航、App 原生
+   * tab bar 的占位）它一无所知。直接用 100dvh 会让卡片底部被底栏压住 ——
+   * 右下角的「列表」按钮和展开后的列表正好躲在底栏下面，看不见也点不到。
+   */
+  _syncFillHeight() {
+    const root = this._els && this._els.root;
+    if (!root || !root.classList || !root.classList.contains('alc-fill')) return 0;
+    if (this._fillSyncing) return this._fillH || 0;
+    const vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    const vh = Math.round((vv && vv.height) || window.innerHeight || 0);
+    // 高度过小说明不是真的可视区（键盘弹出、卡片还在隐藏 Tab 里），先不动
+    if (vh < 200) return 0;
+    const rect = root.getBoundingClientRect ? root.getBoundingClientRect() : null;
+    if (!rect) return 0;
+
+    // 卡片顶端到视口顶部的距离，正是上方被占掉的高度（顶栏与地址栏都在文档流里）
+    const top = Math.max(0, Math.min(Math.round(rect.top), vh - 120));
+    const max = Math.max(160, vh - top);
+
+    this._fillSyncing = true;
+    try {
+      // 先撑到理论最大高度再探测：卡片已经让出过底栏时，底部露出的是页面背景
+      // 而不是底栏，直接探测会测不到遮挡 —— 高度就再也长不回去（缩了就回不来）。
+      root.style.setProperty('--alc-fill-h', `${max}px`);
+      const gap = this._measureBottomGap(vh);
+      const h = Math.max(160, max - gap);
+      root.style.setProperty('--alc-fill-h', `${h}px`);
+      this._fillH = h;
+      this._fillGap = gap;
+      return h;
+    } finally {
+      this._fillSyncing = false;
+    }
+  }
+
+  /**
+   * 底部被「贴底的固定/粘性层」压住的高度（HA 底部导航、App 原生 tab bar 占位、浏览器工具栏）。
+   * 判据：视口底部中心点命中的元素，如果挂在视口底部且 position 为 fixed/sticky，
+   * 它顶边到视口底的距离就是要让出的高度。取不到（jsdom、跨域 iframe）就返回 0。
+   */
+  _measureBottomGap(vh) {
+    const host = this._shadow && this._shadow.host;
+    if (!host || typeof document.elementFromPoint !== 'function') return 0;
+    const x = Math.round((window.innerWidth || 0) / 2);
+    if (!x) return 0;
+    let node = null;
+    try { node = document.elementFromPoint(x, vh - 2); } catch (e) { return 0; }
+    if (!node) return 0;
+    // 命中的是本卡片自己的内容（说明底部没有任何覆盖层）
+    if (node === host) return 0;
+    try { if (node.getRootNode && node.getRootNode() === this._shadow) return 0; } catch (e) { /* ignore */ }
+
+    for (let i = 0; i < 8 && node; i++) {
+      const r = node.getBoundingClientRect ? node.getBoundingClientRect() : null;
+      if (r && r.height > 0 && r.bottom >= vh - 4) {
+        let pos = '';
+        try { pos = (window.getComputedStyle(node) || {}).position || ''; } catch (e) { pos = ''; }
+        if (pos === 'fixed' || pos === 'sticky') {
+          // 上限 40% 视口：真遇到怪异布局也不至于把地图压没
+          return Math.max(0, Math.min(Math.round(vh - r.top), Math.round(vh * 0.4)));
+        }
+      }
+      node = node.parentElement || (node.getRootNode && node.getRootNode().host) || null;
+    }
+    return 0;
+  }
+
+  /** 视口尺寸变化（含 iOS 地址栏收起、旋转）：下一帧校准一次，连续变化只跑一遍 */
+  _scheduleFillSync() {
+    if (this._fillRaf) return;
+    const raf = (typeof window !== 'undefined' && window.requestAnimationFrame)
+      ? window.requestAnimationFrame.bind(window)
+      : (fn) => setTimeout(fn, 16);
+    this._fillRaf = raf(() => {
+      this._fillRaf = null;
+      if (this._cfg) this._resizeMap();
+    });
+  }
+
   /* ------------------------------------------------------ 地图容器 */
 
   _resizeMap() {
+    // 先校准铺满高度（视口 − 上下工具栏），再读容器尺寸 —— 顺序反了会拿到旧高度
+    this._syncFillHeight();
     const wrap = this._els && this._els.mapWrap;
     const w = wrap ? wrap.clientWidth : 0;
     const h = wrap ? wrap.clientHeight : 0;
@@ -2524,6 +2632,20 @@ class AmapLocationCard extends HTMLElement {
     clearTimeout(this._trailing);
     clearTimeout(this._mapTimeout);
     clearTimeout(this._listResizeTimer);
+    clearTimeout(this._fillTimer1);
+    clearTimeout(this._fillTimer2);
+    if (this._fillRaf) {
+      try { (window.cancelAnimationFrame || clearTimeout)(this._fillRaf); } catch (e) { /* ignore */ }
+      this._fillRaf = null;
+    }
+    if (this._onViewportResize) {
+      try {
+        window.removeEventListener('resize', this._onViewportResize);
+        window.removeEventListener('orientationchange', this._onViewportResize);
+        if (window.visualViewport) window.visualViewport.removeEventListener('resize', this._onViewportResize);
+      } catch (e) { /* ignore */ }
+      this._onViewportResize = null;
+    }
     if (this._onClick && this._shadow) { this._shadow.removeEventListener('click', this._onClick); this._onClick = null; }
     if (this._onOnline) {
       try { window.removeEventListener('online', this._onOnline); } catch (e) { /* ignore */ }
@@ -3266,7 +3388,7 @@ const ALC_EDITOR_SECTIONS = [
       ], hint: '坐标来自 GPS 模块、HA Companion App 等 → 选 WGS-84；来自高德/腾讯等国内 App 上报（本身已是高德坐标）→ 必须选 GCJ-02，否则所有点会在高德底图上整体偏移约 300~600 米' },
       { key: 'title', label: '卡片标题（无障碍标签）', type: 'text', hint: '顶部标题栏已取消；这里只作为读屏/悬浮提示用的名称，留空则用实体名称' },
       { key: 'height', label: '地图高度（px）', type: 'number', min: 120, max: 1200, dependsOn: { fill_viewport: false }, hint: '仅在关闭「铺满窗口」时生效' },
-      { key: 'fill_viewport', label: '铺满浏览器窗口', type: 'boolean', hint: '开：地图自动撑满可视区域高度（配置编辑器的预览不会铺满）；关：使用上面的固定高度' },
+      { key: 'fill_viewport', label: '铺满浏览器窗口', type: 'boolean', hint: '开：高度 = 可视高度 − 上方顶栏/地址栏 − 下方底栏/工具栏（HA 底部导航、App tab bar 都算在内），配置编辑器的预览不会铺满；关：使用上面的固定高度' },
       { key: 'view_mode', label: '视图模式', type: 'select', options: [['follow', '自动跟随实体居中'], ['locked', '手动锁定视图']] },
       { key: 'follow_zoom', label: '跟随缩放级别', type: 'number', min: 3, max: 19, dependsOn: { view_mode: 'follow' } },
       { key: 'locked_center', label: '锁定中心（经度,纬度）', type: 'text', dependsOn: { view_mode: 'locked' }, placeholder: '116.397428,39.90923' },
@@ -3656,9 +3778,14 @@ ha-card { overflow:hidden; }
 
 /* 铺满窗口：卡片撑满视口高度，地图吃掉除「展开的列表」外的全部空间。
    HA 配置编辑器里的预览不加 .alc-fill（见 _inEditorPreview），保持原高度不撑爆面板。 */
-.alc-root.alc-fill { display:flex; flex-direction:column; height:100vh; height:100dvh; }
+.alc-root.alc-fill { display:flex; flex-direction:column;
+  height:100vh;                       /* 兜底：不支持 dvh 的老浏览器 */
+  height:100dvh;                      /* 兜底：JS 还没算出来时先按浏览器可视高度铺 */
+  height:var(--alc-fill-h, 100dvh); }  /* 实际值由 _syncFillHeight() 写入：
+                                         可视高度 − 上方顶栏/地址栏 − 下方底栏/工具栏 */
 .alc-root.alc-fill .alc-map-wrap { flex:1 1 auto; min-height:160px; }
-.alc-root.alc-fill .alc-list { max-height:45vh; }
+/* 列表高度也按百分比收敛：卡片让出底栏后总高变小，纯 vh 会把列表顶到地图上方 */
+.alc-root.alc-fill .alc-list { max-height:min(45vh, 55%); }
 /* z-index:0 让 .alc-map 自成叠加上下文，把高德内部的标记/Logo/iframe 全部压在本卡片的
    手势层（z10）之下 —— 交互统一走手势层，不被高德内部 DOM 拦截 */
 .alc-map { position:absolute; inset:0; z-index:0; }
