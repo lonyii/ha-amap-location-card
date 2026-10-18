@@ -254,6 +254,30 @@ function safeUrl(u) {
   return '';
 }
 
+/**
+ * 归一化「朝向」为 0~360 度（0 = 正北，顺时针增加，与 compass bearing 一致）。
+ * 取不到 / 非法值返回 null —— 调用方据此决定「画箭头」还是「画普通图标」。
+ *
+ * 之所以要归一化：不同集成的 heading 可能写成 360、-1、722、-45，
+ * 甚至字符串 "123.4"。旋转 CSS 里 722deg 虽然能用，但数据属性与测试不好对，
+ * 统一收成 [0, 360) 更不容易出意外。
+ */
+function normalizeHeading(v) {
+  const n = toNum(v);
+  if (n === null || !Number.isFinite(n)) return null;
+  // 0 与 360 都表示正北；超出范围按圈回绕（-90 → 270）
+  const deg = ((n % 360) + 360) % 360;
+  return deg === 360 ? 0 : deg;
+}
+
+/** 朝向是否发生了「看得见」的变化：阈值 1°（步行/开车时 heading 每秒抖动多次，没必要次次重绘） */
+function headingChanged(a, b) {
+  if (a === null && b === null) return false;
+  if (a === null || b === null) return true;
+  const d = Math.abs((((b - a) % 360) + 540) % 360 - 180);
+  return d >= 1;
+}
+
 /** Haversine 距离（米） */
 function haversine(lat1, lon1, lat2, lon2) {
   const R = 6371008.8;
@@ -552,6 +576,13 @@ function readEntityLocation(hass, entityId) {
   return {
     ok: true, lat, lon,
     accuracy: toNum(a.gps_accuracy !== undefined ? a.gps_accuracy : a.accuracy),
+    // 朝向（可选）：HA 没有统一的设备朝向属性，主流集成各不相同。
+    // heading 最通用（0 = 正北，顺时针），course / bearing 作为兼容；
+    // 都没有 → null，定位点保持普通图标，不画箭头。
+    heading: normalizeHeading(
+      a.heading !== undefined ? a.heading
+        : (a.course !== undefined ? a.course : a.bearing)
+    ),
     state: st.state,
   };
 }
@@ -1847,7 +1878,11 @@ class AmapLocationCard extends HTMLElement {
     }
     this._notices.delete('loc');
     this._renderNotices();
+    const prevHeading = this._loc ? this._loc.heading : null;
     this._loc = res;
+    // 朝向变了要重画箭头 —— 但 _maybeUpdateMap 只比坐标，heading 单独处理。
+    // 阈值 1°：步行/开车时 heading 每秒抖好几次，没必要每次都重建 DOM。
+    if (this._gcj && headingChanged(prevHeading, res.heading)) this._renderPins();
     this._renderStatus();
     this._maybeUpdateMap();
   }
@@ -3327,8 +3362,30 @@ class AmapLocationCard extends HTMLElement {
 
   /* ------------------------------------------------------ 标记渲染 */
 
-  _pinHtml(icon, size, kind) {
-    return `<div class="alc-pin alc-pin-${kind}" style="width:${size}px;height:${size}px">${iconHtml(icon, size)}</div>`;
+  /**
+   * 单个标记的 DOM。
+   * @param {string} icon    图标描述
+   * @param {number} size    像素直径
+   * @param {string} kind    entity | charging | toilet
+   * @param {number} [heading] 朝向（0 = 正北，顺时针）；只有实体定位点会用
+   *
+   * heading 的两种画法（0 度永远指正北，rotate 正角即顺时针）：
+   *  · 默认图标（十字准星）→ 直接把图标换成方向箭头，这正是最常见的「导航箭头」形态；
+   *  · 用户自定义了 icon_entity（emoji / 头像 / 别的 mdi）→ 保留图标，箭头绕到圆外一侧，
+   *    不把用户的图标配置吞掉。
+   */
+  _pinHtml(icon, size, kind, heading) {
+    const deg = kind === 'entity' ? normalizeHeading(heading) : null;
+    if (deg === null) {
+      return `<div class="alc-pin alc-pin-${kind}" style="width:${size}px;height:${size}px">${iconHtml(icon, size)}</div>`;
+    }
+    const custom = String(icon === undefined || icon === null ? '' : icon).trim() !== ALC_DEFAULTS.icon_entity;
+    const arrow = `<svg class="alc-dir-arrow${custom ? ' alc-dir-arrow-outside' : ''}" viewBox="0 0 48 48"
+      aria-hidden="true" style="transform:translate(-50%,-50%) rotate(${deg}deg)"><path
+      d="M24 3.2 L39.2 41.6 L24 34.2 L8.8 41.6 Z" fill="currentColor"
+      stroke="var(--card-background-color,#fff)" stroke-width="2.4" stroke-linejoin="round"></path></svg>`;
+    return `<div class="alc-pin alc-pin-${kind} alc-pin-heading" data-heading="${deg}"
+      style="width:${size}px;height:${size}px">${arrow}${custom ? iconHtml(icon, size) : ''}</div>`;
   }
 
   _showSourceMarker() {
@@ -3362,6 +3419,8 @@ class AmapLocationCard extends HTMLElement {
         lat: this._gcj.lat,
         data: { kind: 'entity' },
         title: this._entityName(),
+        // 实体带 heading 属性时，定位点画成指向该方位的箭头（0 = 正北）
+        heading: this._loc ? this._loc.heading : null,
       });
     }
 
@@ -3395,19 +3454,30 @@ class AmapLocationCard extends HTMLElement {
       pins.forEach((p) => {
         const poiId = (p.data && p.data.item && p.data.item.poi && p.data.item.poi.id) || `${p.lng},${p.lat}`;
         const key = p.kind === 'entity' ? 'entity' : `${p.kind}:${poiId}`;
+        const html = this._pinHtml(p.icon, p.size, p.kind, p.heading);
         let marker = prev.get(key);
         if (marker) {
           prev.delete(key);
           try { marker.setPosition([p.lng, p.lat]); } catch (e) { /* ignore */ }
+          // 朝向会随实体属性变化（走路/开车时 heading 几十毫秒就变一次）——
+          // 复用同一个 Marker 时必须替换 content，否则箭头停在旧角度上。
+          if (marker.__alcHtml !== html) {
+            try {
+              if (typeof marker.setContent === 'function') marker.setContent(html);
+              if (typeof marker.setExtData === 'function') marker.setExtData(p);
+              marker.__alcHtml = html;
+            } catch (e) { /* ignore */ }
+          }
         } else {
           marker = new AMap.Marker({
             position: [p.lng, p.lat],
-            content: this._pinHtml(p.icon, p.size, p.kind),
+            content: html,
             offset: new AMap.Pixel(-p.size / 2, -p.size / 2),
             zIndex: p.kind === 'entity' ? 200 : 100,
             clickable: true,
             extData: p,
           });
+          marker.__alcHtml = html;
           marker.on('click', () => { /* 点击由手势层命中处理（见 _amapTap） */ });
           added.push(marker);
         }
@@ -3428,7 +3498,7 @@ class AmapLocationCard extends HTMLElement {
         kind: p.kind,
         lng: p.lng,
         lat: p.lat,
-        html: this._pinHtml(p.icon, p.size, p.kind),
+        html: this._pinHtml(p.icon, p.size, p.kind, p.heading),
         data: p,
       })));
     }
@@ -4440,11 +4510,21 @@ ha-card { overflow:hidden; }
 .alc-map canvas { outline:none; }
 
 /* 标记 */
-.alc-pin { display:flex; align-items:center; justify-content:center;
+.alc-pin { position:relative; display:flex; align-items:center; justify-content:center;
   border-radius:50%; background:var(--card-background-color,#fff);
   box-shadow:0 2px 6px rgba(0,0,0,.32); border:2px solid var(--card-background-color,#fff);
   cursor:pointer; overflow:hidden; box-sizing:border-box;
   -webkit-tap-highlight-color:transparent; }
+/* 带朝向的定位点：箭头永远 0° 指北（rotate 正角 = 顺时针）。
+   箭头要给到圆外，所以这里必须解除 .alc-pin 的 overflow:hidden 裁剪。 */
+.alc-pin-heading { overflow:visible; color:#e53935; }
+.alc-pin-heading .alc-dir-arrow {
+  position:absolute; left:50%; top:50%; width:100%; height:100%;
+  transform-origin:50% 50%; pointer-events:none;
+  filter:drop-shadow(0 1px 2px rgba(0,0,0,.3)); }
+/* 自定义图标时箭头绕到圆外，不抢图标的位置 */
+.alc-pin-heading .alc-dir-arrow-outside { width:172%; height:172%; }
+.alc-pin-heading .alc-icon { position:relative; z-index:1; }
 .alc-pin-entity { border-color:#e53935; box-shadow:0 0 0 4px rgba(229,57,53,.20), 0 2px 8px rgba(0,0,0,.35); }
 .alc-pin-charging { border-color:#00a86b; }
 .alc-pin-toilet { border-color:#7e57c2; }
