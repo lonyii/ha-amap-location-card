@@ -13,7 +13,7 @@
  *   · iPhone Safari：touch-action 手势治理、固定 px 高度、WebGL 探测、点击兜底
  * ============================================================================= */
 
-const ALC_VERSION = '1.0.0';
+const ALC_VERSION = '1.0.1';
 const ALC_CARD_TAG = 'amap-location-card';
 const ALC_EDITOR_TAG = 'amap-location-card-editor';
 
@@ -3099,7 +3099,7 @@ class AmapLocationCardEditor extends HTMLElement {
     this._hass = null;
     this._built = false;
     this._pendingUpgrade = false;
-    this._upgradeSig = null;      // 已处理过的能力签名（见 _ensureUpgrade）
+    this._builtSig = null;        // 本次渲染时用的控件能力签名（见 _ensureUpgrade）
     this._upgradeWait = 2500;     // 等原生控件注册的上限；测试会调小
     this._blurHooked = false;
   }
@@ -3149,17 +3149,17 @@ class AmapLocationCardEditor extends HTMLElement {
    * 表现就是配置面板每 2.5 秒整体重建一次：输入框失焦、滚动条回到顶部、值被回填，
    * 根本没法改配置。
    *
-   * 现在的规则：**按能力签名决定**——同一档能力只重建一次，只有「能力真的变多」才重建；
+   * 现在的规则：**按「已渲染的能力签名」判断**——渲染时记下当时的能力档位，
+   * 只有能力真的多于已渲染的档位才升级，升级后签名同步前移，天然不会循环；
    * 正在输入时一律推迟到失焦。
    */
   _ensureUpgrade() {
     if (this._pendingUpgrade) return;
     const sig = this._capSig();
-    if (sig === this._upgradeSig) return;       // 这一档已经处理过，绝不再重建
+    if (sig === this._builtSig) return;         // 与已渲染的档位一致 → 无需升级
     if (this._focusInside()) { this._retryUpgradeOnBlur(); return; }
 
     this._pendingUpgrade = true;
-    this._upgradeSig = sig;                     // 先记账：保证同一档最多重建一次
     Promise.race([
       Promise.all([
         customElements.whenDefined('ha-entity-picker').catch(() => {}),
@@ -3168,10 +3168,9 @@ class AmapLocationCardEditor extends HTMLElement {
       sleep(this._upgradeWait || 2500),
     ]).then(() => {
       this._pendingUpgrade = false;
-      if (this._capSig() === sig) return;       // 能力没变 → 保持现有控件，不再重建
+      if (this._capSig() === this._builtSig) return;   // 没有新能力到位 → 保持现状，不再重建
       if (this._focusInside()) { this._retryUpgradeOnBlur(); return; }
-      this._built = false;
-      this._build();
+      this._build();                                   // 只升级一次，_builtSig 会在 _build 里前移
     });
   }
 
@@ -3193,6 +3192,7 @@ class AmapLocationCardEditor extends HTMLElement {
 
   _build() {
     this._built = true;
+    this._builtSig = this._capSig();     // 记录本次实际用的是哪一档控件
     this._shadow.innerHTML = `<style>${ALC_EDITOR_STYLES}</style><div class="alc-ed"></div>`;
     this._root = this._shadow.querySelector('.alc-ed');
     this._renderSections();
