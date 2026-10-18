@@ -531,36 +531,39 @@ locations=999,999  →  {"status":"1","info":"ok","infocode":"10000","locations"
 
 ---
 
-## 本地验收（不装 HA）
+## 本地预览（可选）
 
-直接双击打开 `demo.html`（或用任意静态服务器），它已按下面的默认值配好，**打开即可用**：
+> **演示页 `demo.html` 不随仓库发布**：它预填了开发用的高德 Key，发布等于公开 Key。
+> 卡片是单文件、无构建，任意静态页面都能挂载；需要可视化调试时在本地保留一份 demo 即可。
+
+本地这份 demo 的默认设置：
 
 - 高德 Key 已预填（测试坐标：**南昌市青山湖区罗家镇观田一带**，实体位置 `115.984158, 28.641333` WGS-84）；
 - 默认**加载真实高德底图**（取消勾选「加载真实高德底图」即切回简化视图）；
 - 坐标转换**透传真实高德接口**，保证与真实底图对齐；
-- 周边检索被本地拦截并返回构造数据：含带电价 / 不带电价两种充电站、空结果公厕；
+- 周边检索默认走**真实接口**；勾选「Mock 检索」切换为本地构造数据（点位围绕检索中心随机散布，名称地址均为虚构，地图左上角有「Mock 演示数据」角标）；
 - 搜索范围默认「自动 · 跟随地图缩放」，侧栏实时显示当前生效半径，**缩放地图即可看到半径与结果同步变化**。
 
 侧栏还可以模拟各种异常：接口限流报错（infocode 10003）、返回空结果、接口延迟、
 坐标转换网络异常（HTTP 500）、坐标转换限流（infocode 10004）、坐标转换越界回显、
-实体无经纬度。
-右下日志会打印每一次被拦截的高德请求。demo **默认走真实接口**（Key 已预填）；勾选「Mock 检索」可离线演示，此时地图左上角会出现「Mock 演示数据」角标，假数据点位围绕检索中心随机散布、名称地址均为虚构（模拟充电站 A/B/C…），避免与真实地名混淆。
+实体无经纬度。右下日志会打印每一次被拦截的高德请求。
 
 ---
 
 ## 开发
 
 ```bash
-# 语法检查
+# 语法检查（CI 里跑的就是这一句）
 node --check amap-location-card.js
+```
 
-# 全部测试（需先 npm i jsdom，仅测试用）
-npm test
+完整测试脚本（`.smoke-test.cjs` / `.dom-test.cjs` / `.demo-check.cjs` / `.geo-audit.cjs`）
+**仅本地保留，不随仓库发布**。本地运行方式：
 
-# 或分别运行
-node .smoke-test.cjs   # 124 项：坐标校验 / 距离 / 缓存 / 节流 / POI 解析 / 字段探测 / 链接构造 / 降级链 / 转换响应侧校验 / infocode 映射 / 底图失败诊断 / 投影 / 半径配置
-node .dom-test.cjs     # 217 项：jsdom 真实渲染 —— 两种地图分支 / 标记 / 弹窗 / 列表 / 事件委托 / 编辑器 / 自动半径与拖动重搜 / 转换异常降级 / 建图抛错 / 联网自动重试 / 生命周期
-node .demo-check.cjs   # 71 项：demo 页 DOM 引用完整性、预填 Key 与坐标、脚本语法、配置项拼写、失败可排查性
+```bash
+node .smoke-test.cjs   # 143 项：坐标校验 / 距离 / 缓存 / 节流 / POI 解析 / 字段探测 / 链接构造 / 降级链 / 转换响应侧校验 / infocode 映射 / 底图失败诊断 / 投影 / 半径配置
+node .dom-test.cjs     # 217 项：jsdom 真实渲染 —— 两种地图分支 / 标记 / 弹窗 / 列表 / 事件委托 / 编辑器 / 自动半径与拖动重搜 / 转换异常降级 / 建图抛错 / 联网自动重试 / 生命周期（需 npm i jsdom）
+node .demo-check.cjs   # 77 项：demo 页 DOM 引用完整性、预填 Key 与坐标、脚本语法、配置项拼写、失败可排查性
 ```
 
 测试在 Node / jsdom 中桩掉浏览器全局后加载**同一份源码**，因此测的就是发布的那份文件，
@@ -570,19 +573,36 @@ node .demo-check.cjs   # 71 项：demo 页 DOM 引用完整性、预填 Key 与�
 自绘弹窗、手势层拖拽/滚轮/捏合/轻点命中、`setFitView` 铺满显示、Circle 半径圈、
 控件挂载）与简化视图分支（Canvas 绘制、视口裁剪、标记 DOM）。
 
+### 发布
+
+```bash
+./push.sh                 # 一键提交并推送（只提交关键文件）
+./push.sh -n              # 预演：只打印将要提交的变更，不提交
+./push.sh -m "fix: xxx"   # 自定义提交信息
+./push.sh --with-tests    # 连测试脚本一起发布
+```
+
+Windows 上直接 **双击 `push.cmd`** 也行（自动定位 Git Bash，跑完停住让你看结果）。
+`.cmd` 必须用 CRLF 换行，`.gitattributes` 已固定该规则，`push.sh` 每次运行也会自动纠正。
+
+发布白名单：`amap-location-card.js`、`README.md`、`hacs.json`、`package.json`、
+`.gitignore`、`.github/`。`demo.html` 与测试脚本被 `.gitignore` 挡在仓库外
+（demo 内含本地 Key，绝不外发）。
+
 ### 目录结构
 
 ```
-amap-location-card/
+ha-amap-location-card/        # GitHub 仓库（只含发布文件）
 ├── amap-location-card.js     # 卡片本体（唯一交付物，单文件免构建）
-├── demo.html                 # 验收页（默认真实接口；可勾选 Mock 离线演示，假数据带角标）
 ├── hacs.json                 # HACS 元数据
 ├── package.json
 ├── README.md
-├── .smoke-test.cjs           # 开发用测试
-├── .dom-test.cjs
-├── .demo-check.cjs
+├── push.sh                   # 一键发布脚本
 └── .github/workflows/validate.yaml
+
+本地额外保留（不发布）：
+├── demo.html                 # 可视化验收页（含预填 Key）
+├── .smoke-test.cjs / .dom-test.cjs / .demo-check.cjs / .geo-audit.cjs
 ```
 
 ---

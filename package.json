@@ -1,0 +1,29 @@
+{
+  "name": "amap-location-card",
+  "version": "1.0.0",
+  "description": "Home Assistant Lovelace 卡片：高德地图底图 + 实体定位 + WGS84→GCJ02 纠偏 + 周边充电桩/公共厕所检索",
+  "main": "amap-location-card.js",
+  "license": "MIT",
+  "keywords": [
+    "home-assistant",
+    "lovelace",
+    "hacs",
+    "custom-card",
+    "amap",
+    "gaode",
+    "map",
+    "charging-station"
+  ],
+  "scripts": {
+    "check": "node --check amap-location-card.js"
+  },
+  "files": [
+    "amap-location-card.js",
+    "hacs.json",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lonyii/ha-amap-location-card.git"
+  }
+}
