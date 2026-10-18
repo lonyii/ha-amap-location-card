@@ -16,7 +16,7 @@
  *   · iPhone Safari：touch-action 手势治理、固定 px 高度、WebGL 探测、点击兜底
  * ============================================================================= */
 
-const ALC_VERSION = '1.0.10';
+const ALC_VERSION = '1.0.11';
 const ALC_CARD_TAG = 'amap-location-card';
 const ALC_EDITOR_TAG = 'amap-location-card-editor';
 
