@@ -16,7 +16,7 @@
  *   · iPhone Safari：touch-action 手势治理、固定 px 高度、WebGL 探测、点击兜底
  * ============================================================================= */
 
-const ALC_VERSION = '1.2.1';
+const ALC_VERSION = '1.2.2';
 const ALC_CARD_TAG = 'amap-scout';
 const ALC_EDITOR_TAG = 'amap-scout-editor';
 
@@ -3788,7 +3788,6 @@ class AmapLocationCard extends HTMLElement {
         <div class="alc-pop-row"><span class="k">纠偏</span><span class="v">${this._convertViaLabel()}</span></div>
         <div class="alc-pop-actions">
           <button type="button" class="alc-pop-btn primary" data-alc-act="open-url" data-url="${escapeHtml(navUrl)}">高德导航</button>
-          <button type="button" class="alc-pop-btn" data-alc-act="close">关闭</button>
         </div>
       </div>`;
   }
@@ -3824,7 +3823,6 @@ class AmapLocationCard extends HTMLElement {
         <div class="alc-pop-actions">
           <button type="button" class="alc-pop-btn primary" data-alc-act="open-url" data-url="${escapeHtml(navUrl)}">高德导航</button>
           <button type="button" class="alc-pop-btn" data-alc-act="open-url" data-url="${escapeHtml(markerUrl)}">地图标注</button>
-          <button type="button" class="alc-pop-btn" data-alc-act="close">关闭</button>
         </div>
       </div>`;
   }

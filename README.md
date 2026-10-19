@@ -675,7 +675,8 @@ JS API：v2.0 · https://webapi.amap.com/maps
    拖拽 / 捏合 / 滚轮 / 双击 / 轻点全部由卡片接管，再把结果以
    `setCenter` / `setZoom` 等**程序化 API** 驱动高德 —— 渲染、瓦片、标记仍由高德负责。
 2. **弹窗自绘**：高德 `InfoWindow` 同样收不到点击（在 iframe 盾之下），改为卡片自绘
-   弹窗（`.alc-amap-pop`），跟随锚点移动、出画自动收起、点空白关闭。
+   弹窗（`.alc-amap-pop`），跟随锚点移动、出画自动收起、点空白关闭；关闭只靠右上角
+   `×`（v1.2.2 起不再放文字「关闭」按钮）。
 3. **缩放按钮自绘**：高德 `ToolBar` 在 Shadow DOM 下不可点，改为卡片自绘 ＋/− 按钮。
 4. **不要关 `zoomEnable`**：实测 AMap 2.0 里 `zoomEnable:false` 会连带禁掉
    **程序化** `setZoom` / `setFitView` 的缩放（内部耦合），所以只关 `scrollWheel`
