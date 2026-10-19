@@ -16,7 +16,7 @@
  *   · iPhone Safari：touch-action 手势治理、固定 px 高度、WebGL 探测、点击兜底
  * ============================================================================= */
 
-const ALC_VERSION = '1.2.0';
+const ALC_VERSION = '1.2.1';
 const ALC_CARD_TAG = 'amap-scout';
 const ALC_EDITOR_TAG = 'amap-scout-editor';
 
@@ -2212,7 +2212,9 @@ class AmapLocationCard extends HTMLElement {
     const before = this._fillH || 0;
     const h = this._syncFillHeight();
     if (h && Math.abs(h - before) > 2) {
-      this._log(`铺满高度变化 ${before} → ${h}（上方让出 ${this._fillTop || 0}，底部让出 ${this._fillGap || 0}）`);
+      const flow = this._fillFlowGap || 0;
+      this._log(`铺满高度变化 ${before} → ${h}（上方让出 ${this._fillTop || 0}，`
+        + `底部让出 ${(this._fillGap || 0) + flow}${flow ? `（含编辑模式文档流 ${flow}）` : ''}）`);
       this._resizeMap();
     }
     return h;
@@ -2256,13 +2258,19 @@ class AmapLocationCard extends HTMLElement {
       // 而不是底栏，直接探测会测不到遮挡 —— 高度就再也长不回去（缩了就回不来）。
       root.style.setProperty('--alc-fill-h', `${max}px`);
       const gap = this._measureBottomGap(vh);
+      // ③ 文档流里排在卡片后面的内容（HA 编辑模式的底部编辑工具栏）：它不遮盖卡片，
+      //    只是把页面撑出滚动条 —— 表现就是「编辑按钮要下拉滚动条才能看到」。
+      //    卡片已撑满视口，此时页面多出来的可滚动高度就是它们占的高度。
+      //    只在 HA 编辑模式下计入：普通长仪表盘下面排着其他卡片，不该据此缩卡片。
+      const flowGap = this._measureFlowGap(vh);
       // 底部再留一点安全区：iPhone 的 Home 指示条 + 一点视觉呼吸，
       // 这样哪怕是 HA 编辑模式的浮动按钮也不会贴着地图边。
       const safe = this._safeAreaBottom() + ALC_FILL_SAFE_BOTTOM;
-      const h = Math.max(160, max - gap - safe);
+      const h = Math.max(160, max - gap - flowGap - safe);
       root.style.setProperty('--alc-fill-h', `${h}px`);
       this._fillH = h;
       this._fillGap = gap;
+      this._fillFlowGap = flowGap;
       this._fillTop = top;
       return h;
     } finally {
@@ -2351,6 +2359,43 @@ class AmapLocationCard extends HTMLElement {
       node = node.parentElement || (node.getRootNode && node.getRootNode().host) || null;
     }
     return 0;
+  }
+
+  /**
+   * 是否处于 HA 仪表板编辑模式（顶栏出现「完成」按钮的那个状态）。
+   * 判据：沿 shadow 宿主向上找 hui-view（其 lovelace 属性带 editMode）与
+   * hui-root（自身有 editMode 布尔属性），两者任一命中即算。取不到按不在
+   * 编辑模式处理 —— 只影响要不要给文档流后方的编辑工具栏让位，宁可不缩。
+   */
+  _inHaEditMode() {
+    try {
+      let n = this._shadow && this._shadow.host;
+      for (let i = 0; i < 24 && n; i++) {
+        const tag = (n.localName || '').toLowerCase();
+        if (tag === 'hui-view') {
+          const lv = n.lovelace;
+          if (lv && typeof lv === 'object' && 'editMode' in lv) return !!lv.editMode;
+        }
+        if (tag === 'hui-root' && typeof n.editMode === 'boolean') return n.editMode;
+        n = n.parentElement || (n.getRootNode && n.getRootNode().host) || null;
+      }
+    } catch (e) { /* ignore */ }
+    return false;
+  }
+
+  /**
+   * 文档流里排在卡片后面的内容占掉的高度（HA 编辑模式底部的编辑工具栏）。
+   * 判据：卡片已撑满视口时，documentElement 的可滚动溢出就是它们的高度。
+   * 只在编辑模式下生效（普通长仪表盘下方还有别的卡片，不能据此缩），
+   * 上限 40% 视口，量不到（jsdom / 溢出可忽略）返回 0。
+   */
+  _measureFlowGap(vh) {
+    if (!this._inHaEditMode()) return 0;
+    const doc = (typeof document !== 'undefined' && document.documentElement) || null;
+    if (!doc) return 0;
+    const overflow = Math.max(0, (doc.scrollHeight || 0) - (doc.clientHeight || 0));
+    if (overflow <= 2) return 0;
+    return Math.min(overflow, Math.round(vh * 0.4));
   }
 
   /** 视口尺寸变化（含 iOS 地址栏收起、旋转）：下一帧校准一次，连续变化只跑一遍 */

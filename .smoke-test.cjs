@@ -676,6 +676,16 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   ok('编辑器暴露夜间主题选项', !!themeField && themeField.type === 'select'
     && themeField.options.some((o) => o[0] === 'dark') && themeField.options.some((o) => o[0] === 'light'));
 
+  console.log('\n=== 15. 编辑模式铺满让位 ===');
+  const srcFill = fs.readFileSync(SRC, 'utf8');
+  ok('铺满高度计入文档流后方的编辑工具栏',
+    srcFill.includes('_measureFlowGap') && /max - gap - flowGap - safe/.test(srcFill));
+  ok('文档流让位只在编辑模式生效（不缩普通长仪表盘）',
+    /_measureFlowGap\(vh\)\s*\{[\s\S]{0,200}_inHaEditMode/.test(srcFill));
+  ok('编辑模式检测走 hui-view.lovelace / hui-root.editMode',
+    /'hui-view'/.test(srcFill) && /'hui-root'/.test(srcFill));
+  ok('文档流让位有 40% 视口封顶', /Math\.min\(overflow,\s*Math\.round\(vh \* 0\.4\)\)/.test(srcFill));
+
   console.log('');
   console.log(results.join('\n'));
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

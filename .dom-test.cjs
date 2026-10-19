@@ -835,6 +835,78 @@ const baseConfig = () => Object.assign({}, T.ALC_DEFAULTS, {
     made.forEach((c) => { try { c.remove(); } catch (e) { /* ignore */ } });
   }
 
+  /* ---------- H2d. HA 编辑模式：文档流后方的编辑工具栏也要让位 ---------- */
+  console.log('\n=== H2d. HA 编辑模式（文档流编辑栏）让位 ===');
+  {
+    const docEl = window.document.documentElement;
+    const origEfp2 = document.elementFromPoint;
+    document.elementFromPoint = () => null;
+
+    // 模拟 HA 编辑模式：编辑工具栏排在卡片后面的文档流里（不悬浮、不遮盖），
+    // 卡片撑满视口后 documentElement 就会多出等高的可滚动溢出。
+    const setDocOverflow = (extra) => {
+      Object.defineProperty(docEl, 'scrollHeight', { configurable: true, get: () => VH + extra });
+      Object.defineProperty(docEl, 'clientHeight', { configurable: true, get: () => VH });
+    };
+    const clearDocOverflow = () => {
+      delete docEl.scrollHeight;
+      delete docEl.clientHeight;
+    };
+
+    // 1. 编辑模式检测
+    const plain = freshCard(baseConfig());
+    eq('祖先链上没有 hui-view → 不算编辑模式', plain._inHaEditMode(), false);
+
+    const hv = window.document.createElement('hui-view');
+    hv.lovelace = { editMode: true };
+    window.document.body.appendChild(hv);
+    const ed = freshCard(baseConfig());
+    hv.appendChild(ed);
+    eq('hui-view.lovelace.editMode = true → 编辑模式', ed._inHaEditMode(), true);
+
+    hv.lovelace = { editMode: false };
+    eq('lovelace.editMode = false → 不算编辑模式', ed._inHaEditMode(), false);
+
+    const hr = window.document.createElement('hui-root');
+    window.document.body.appendChild(hr);
+    hr.appendChild(hv);
+    hv.lovelace = { other: 1 }; // hui-view 上取不到 → 落到 hui-root
+    hr.editMode = true;
+    eq('hui-root.editMode 兜底命中', ed._inHaEditMode(), true);
+
+    // 2. 编辑模式 + 页面被编辑栏撑出 56px 溢出 → 铺满高度要扣掉它
+    hr.editMode = true;
+    hv.lovelace = { editMode: true };
+    setDocOverflow(56);
+    eq('编辑模式扣掉文档流后方的编辑工具栏（56px）', ed._syncFillHeight(), VH - 56 - SAFE);
+    eq('量到的文档流让位高度被记下来', ed._fillFlowGap, 56);
+
+    // 3. 溢出高得离谱时按 40% 视口封顶
+    setDocOverflow(VH);
+    eq('文档流让位最多 40% 视口', ed._syncFillHeight(), VH - Math.round(VH * 0.4) - SAFE);
+
+    // 4. 溢出可忽略（≤2px）不让位
+    setDocOverflow(1);
+    eq('溢出 ≤2px 视为没有编辑栏', ed._syncFillHeight(), VH - SAFE);
+
+    // 5. 退出编辑模式 → 不再扣，高度长回去
+    hv.lovelace = { editMode: false };
+    setDocOverflow(56);
+    eq('退出编辑模式后高度恢复（不给普通仪表盘缩卡片）', ed._syncFillHeight(), VH - SAFE);
+    eq('退出编辑模式后 flowGap 清零', ed._fillFlowGap, 0);
+
+    // 6. 不在编辑模式时即使有溢出也不缩（长仪表盘下面还有别的卡片）
+    setDocOverflow(600);
+    eq('非编辑模式不因页面溢出缩卡片', ed._syncFillHeight(), VH - SAFE);
+
+    clearDocOverflow();
+    if (origEfp2) document.elementFromPoint = origEfp2; else delete document.elementFromPoint;
+    try { plain.remove(); } catch (e) { /* ignore */ }
+    try { ed.remove(); } catch (e) { /* ignore */ }
+    hv.remove();
+    hr.remove();
+  }
+
   /* ---------- R. iOS App 底图：强制 WebGL / 瓦片底图 ---------- */
   console.log('\n=== R. iOS App 底图修复（force_webgl / basemap / GL 提示识别） ===');
   {

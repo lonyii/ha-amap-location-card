@@ -1,6 +1,6 @@
 {
   "name": "ha-amap-scout",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Home Assistant Lovelace 卡片：以实体为圆心的高德地图 —— 定位朝向 + WGS84→GCJ02 纠偏 + 周边充电桩/公厕检索 + 一键导航",
   "main": "amap-location-card.js",
   "license": "MIT",
